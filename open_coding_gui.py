@@ -224,6 +224,25 @@ def first_value(row: dict[str, str], *names: str) -> str:
     return ""
 
 
+def reader_context(row: dict[str, str], mode: str = "selected") -> tuple[str, str]:
+    """Return the selected evidence or the wider audit context for a coding row."""
+    original = first_value(row, "quote_verbatim", "original_text", "原始文字", "原文")
+    selected = first_value(row, "evidence_context", "code_context")
+    complete = first_value(row, "full_context", "完整上下文")
+    if not complete:
+        context_parts = [
+            first_value(row, "context_before", "前文"),
+            f"【目標片段】{original}" if original else "",
+            first_value(row, "context_after", "後文"),
+        ]
+        complete = "\n".join(part for part in context_parts if part)
+    selected = selected or complete
+    complete = complete or selected
+    if mode == "full":
+        return "完整上下文（搜尋視窗／稽核用）", complete or "（舊版 CSV 沒有上下文欄位）"
+    return "精選語證（與本 code 直接相關）", selected or "（舊版 CSV 沒有上下文欄位）"
+
+
 class CodingResultReader(tk.Toplevel):
     """Card-style, one-coding-at-a-time CSV reader."""
 
@@ -250,6 +269,7 @@ class CodingResultReader(tk.Toplevel):
         self.position_var = tk.StringVar(value="尚未載入結果")
         self.meta_var = tk.StringVar()
         self.jump_var = tk.StringVar(value="1")
+        self.context_mode_var = tk.StringVar(value="selected")
         self._build()
         self.bind("<Left>", lambda _event: self._previous())
         self.bind("<Right>", lambda _event: self._next())
@@ -287,6 +307,17 @@ class CodingResultReader(tk.Toplevel):
         self.file_combo.grid(row=0, column=1, sticky="ew")
         self.file_combo.bind("<<ComboboxSelected>>", self._file_selected)
         ttk.Button(file_bar, text="開啟 CSV…  Ctrl+O", command=self.choose_csv).grid(row=0, column=2, padx=(8, 0))
+        context_mode = ttk.Frame(file_bar)
+        context_mode.grid(row=1, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        ttk.Label(context_mode, text="上下文顯示：").pack(side="left")
+        ttk.Radiobutton(
+            context_mode, text="精選語證", variable=self.context_mode_var,
+            value="selected", command=self._render,
+        ).pack(side="left", padx=(2, 10))
+        ttk.Radiobutton(
+            context_mode, text="完整上下文", variable=self.context_mode_var,
+            value="full", command=self._render,
+        ).pack(side="left")
 
         ttk.Label(outer, textvariable=self.meta_var, foreground="#555555").grid(row=3, column=0, sticky="w", pady=(0, 5))
         self.context_box = ttk.LabelFrame(outer, text="與本 code 相關的原文範圍", padding=8)
@@ -427,19 +458,11 @@ class CodingResultReader(tk.Toplevel):
             self._finish_render()
             return
 
-        self.context_box.configure(text="與本 code 相關的原文範圍")
         self.original_box.configure(text="實際 Coding 片段")
         self.code_heading.configure(text="Code（情境／前因 → 想法或行為 → 結果／意義）")
         self.why_heading.configure(text="Why this code")
         original = first_value(row, "quote_verbatim", "original_text", "原始文字", "原文")
-        full_context = first_value(row, "evidence_context", "code_context", "full_context", "完整上下文")
-        if not full_context:
-            context_parts = [
-                first_value(row, "context_before", "前文"),
-                f"【目標片段】{original}" if original else "",
-                first_value(row, "context_after", "後文"),
-            ]
-            full_context = "\n".join(part for part in context_parts if part)
+        context_title, context_text = reader_context(row, self.context_mode_var.get())
         code = first_value(row, "code", "Code", "編碼")
         why = first_value(row, "why_this_code", "rationale", "coding_reason", "理由")
         segment = first_value(row, "segment_id", "segment", "段落")
@@ -469,8 +492,8 @@ class CodingResultReader(tk.Toplevel):
         if quality_parts:
             metadata.append("品質：" + "、".join(quality_parts))
         self.meta_var.set("  |  ".join(metadata))
-        self.context_box.configure(text="與本 code 相關的原文範圍")
-        self._set_text(self.context_text, full_context or "（舊版 CSV 沒有完整上下文欄位）")
+        self.context_box.configure(text=context_title)
+        self._set_text(self.context_text, context_text)
         self._set_text(self.original_text, original or "（CSV 沒有原始文字欄位）")
         self._set_text(self.code_text, code or "（CSV 沒有 code 欄位）")
         self._set_text(self.why_text, why or "（CSV 沒有 why_this_code／rationale 欄位）")

@@ -28,6 +28,20 @@ class OpenCodingTests(unittest.TestCase):
                 writer.writerow({"source_file": "fixture.txt", "code": "測試編碼"})
             self.assertEqual(open_coding_gui.read_coding_csv(path)[0]["code"], "測試編碼")
 
+    def test_reader_can_switch_between_selected_and_full_context(self):
+        row = {
+            "quote_verbatim": "目標回答",
+            "evidence_context": "主題問題\n目標回答",
+            "full_context": "較早的討論\n主題問題\n目標回答\n後續追問",
+        }
+        selected_title, selected = open_coding_gui.reader_context(row)
+        full_title, full = open_coding_gui.reader_context(row, "full")
+        self.assertIn("精選語證", selected_title)
+        self.assertEqual(selected, "主題問題\n目標回答")
+        self.assertIn("完整上下文", full_title)
+        self.assertIn("較早的討論", full)
+        self.assertIn("後續追問", full)
+
     def test_segmentation_preserves_location_speaker_and_context(self):
         segments = open_coding.segment_transcript("提問者：測試問題。\n參與者：測試陳述甲。測試陳述乙！")
         self.assertEqual([item.text for item in segments], ["測試問題。", "測試陳述甲。", "測試陳述乙！"])
