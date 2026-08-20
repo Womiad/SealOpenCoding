@@ -1179,6 +1179,24 @@ def render_research_directions(synthesis: dict) -> str:
     return "\n\n".join(blocks)
 
 
+def _merge_unique_codings(*groups: list[dict]) -> list[dict]:
+    """Preserve parent/child discoveries while removing exact repeat rows."""
+    merged: list[dict] = []
+    seen: set[tuple[str, str, str]] = set()
+    for group in groups:
+        for row in group:
+            key = (
+                str(row.get("segment_id", "")),
+                str(row.get("evidence_quote", "")),
+                str(row.get("code", "")),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(row)
+    return merged
+
+
 def analyze_chunk(
     guide: str,
     chunk: list[Segment],
@@ -1186,11 +1204,12 @@ def analyze_chunk(
     label: str,
     depth: int = 0,
 ) -> tuple[list[dict], int]:
-    """Analyze one chunk, recursively bisecting it when grounding fails.
+    """Analyze one chunk, bisecting on failures or suspiciously sparse recall.
 
     A local model can occasionally paraphrase evidence in a large prompt. A
-    smaller retry usually restores exact copying. One bad subchunk must not
-    discard valid results from the rest of a long interview.
+    smaller retry usually restores exact copying. A large substantive chunk
+    returning at most one candidate is also rescanned as two smaller chunks.
+    Parent discoveries are retained, so recovery never discards a valid row.
     """
     respondent_only = bool(getattr(args, "respondent_only", False))
     allowed_ids = {s.id for s in chunk if not respondent_only or s.speaker == "受訪者"}
@@ -1225,6 +1244,32 @@ def analyze_chunk(
             )
             if attempted_substantive and not validated:
                 raise RuntimeError("模型回傳的 code 無法用原文證據定位")
+            substantive_count = sum(
+                1 for segment in chunk
+                if segment.id in allowed_ids and is_valid_primary_evidence(segment)
+            )
+            if (
+                len(chunk) >= 12
+                and substantive_count >= max(4, len(chunk) // 3)
+                and len(validated) <= 1
+            ):
+                midpoint = len(chunk) // 2
+                indent = "  " * depth
+                print(
+                    f"    {indent}{label} 候選過少（{len(validated)} 個／{substantive_count} 個實質片段），"
+                    f"自動拆成 {midpoint} 句 + {len(chunk) - midpoint} 句重掃",
+                    flush=True,
+                )
+                left_rows, left_skipped = analyze_chunk(
+                    guide, chunk[:midpoint], args, label + "A", depth + 1
+                )
+                right_rows, right_skipped = analyze_chunk(
+                    guide, chunk[midpoint:], args, label + "B", depth + 1
+                )
+                return (
+                    _merge_unique_codings(validated, left_rows, right_rows),
+                    left_skipped + right_skipped,
+                )
             return validated, 0
         except RuntimeError as exc:
             last_error = exc

@@ -23,7 +23,7 @@ SCRIPT = APP_DIR / "open_coding.py"
 ICON = APP_DIR / "seal_open_coding_icon.png"
 READER_ICON = APP_DIR / "seal_code_reader_icon.png"
 APP_NAME = "海豹牌 Open Coding 工具"
-APP_VERSION = "V1.4"
+APP_VERSION = "V1.5"
 FILE_TYPES = [
     ("支援的文檔", "*.txt *.md *.docx"),
     ("文字檔", "*.txt"),
@@ -160,6 +160,7 @@ def seal_companion_for_log(message: str, rotation_index: int = 0) -> str | None:
         (("分析：",), "🦭 海豹攤開這篇訪談，開始找重要線索。"),
         (("逾時", "改拆成"), "🦭⏱ 這段游得太久，海豹把它拆小再試，不會丟下整篇。"),
         (("定位失敗", "改拆成"), "🦭 這段有點滑，海豹把它拆小再仔細看。"),
+        (("候選過少", "自動拆成"), "🦭🔎 這段線索少得不尋常，海豹拆小後再掃一次。"),
         (("警告：略過",), "🦭⚠ 海豹無法可靠確認這一小段，先保守略過。"),
         (("聚焦精選：",), "🦭 海豹把候選 code 排開，準備挑出真正重要的。"),
         (("初選",), "🦭 海豹把太細、無關和理所當然的 code 輕輕撥開。"),
@@ -194,6 +195,8 @@ def status_context_for_log(message: str) -> str | None:
         return "篩選階段 完成"
     if "改用 code 分數" in text:
         return "篩選階段 分數回退"
+    if "候選過少" in text and "自動拆成" in text:
+        return "初始 Coding 候選過少重掃"
     if "語證範圍校正" in text:
         match = re.search(r"語證範圍校正\s+(\d+)/(\d+)", text)
         return f"語證校正 {match.group(1)}/{match.group(2)}" if match else "語證校正 完成"
@@ -659,7 +662,7 @@ class OpenCodingGUI(tk.Tk):
         ttk.Label(settings, text="不足時在同一題內補相鄰發言", foreground="#555555").grid(row=1, column=6, columnspan=2, sticky="w", pady=(7, 0))
         ttk.Label(
             settings,
-            text="V1.4 會加入討論主題錨點，再校正主句與彈性上下文；預設前後各 12 句。",
+            text="V1.5 候選過少會自動拆批重掃；上下文保留主題錨點且預設至少 5 句。",
             foreground="#555555",
         ).grid(row=2, column=0, columnspan=8, sticky="w", pady=(7, 0))
 

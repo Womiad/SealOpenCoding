@@ -261,6 +261,45 @@ class OpenCodingTests(unittest.TestCase):
         self.assertEqual(skipped, 1)
         self.assertEqual([row["segment_id"] for row in rows], ["S000002"])
 
+    def test_sparse_large_chunk_splits_and_preserves_parent_candidate(self):
+        segments = open_coding.segment_transcript("\n".join(
+            f"參與者：合成實質經驗片段{i}包含具體行動。" for i in range(1, 13)
+        ))
+        args = Namespace(host="local", model="test", timeout=10, retries=0, min_codes=0)
+        calls = []
+
+        def result_for(segment_id, evidence):
+            return {"codings": [{
+                "segment_id": segment_id, "evidence_quote": evidence,
+                "code": f"由{segment_id}形成的合成行為模式。",
+                "rationale": "合成來源直接支持。", "confidence": 0.9,
+            }]}
+
+        def fake_chat(_host, _model, _system, prompt, _timeout):
+            calls.append(prompt)
+            visible_ids = [
+                item.id for item in segments
+                if f'"segment_id": "{item.id}", "speaker"' in prompt
+            ]
+            if len(visible_ids) >= 12:
+                return result_for("S000001", segments[0].text)
+            if "S000001" in visible_ids:
+                return result_for("S000002", segments[1].text)
+            return result_for("S000010", segments[9].text)
+
+        with patch.object(open_coding, "ollama_chat", side_effect=fake_chat):
+            rows, skipped = open_coding.analyze_chunk("合成研究規則", segments, args, "測試區塊")
+        self.assertEqual(skipped, 0)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(
+            {row["segment_id"] for row in rows},
+            {"S000001", "S000002", "S000010"},
+        )
+
+    def test_parent_child_exact_candidate_is_deduplicated(self):
+        row = {"segment_id": "S000001", "evidence_quote": "合成語證", "code": "合成 code"}
+        self.assertEqual(open_coding._merge_unique_codings([row], [dict(row)]), [row])
+
     def test_code_file_writes_source_grounded_csv(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -310,6 +349,12 @@ class OpenCodingTests(unittest.TestCase):
         self.assertEqual(open_coding_gui.format_elapsed(3661.9), "01:01:01")
         self.assertEqual(open_coding_gui.status_context_for_log("初選 2/5：20 個候選"), "篩選階段 初選 2/5")
         self.assertEqual(open_coding_gui.status_context_for_log("語證範圍校正 2/3：8 個 code"), "語證校正 2/3")
+        self.assertEqual(
+            open_coding_gui.status_context_for_log(
+                "區塊 2 候選過少（1 個／8 個實質片段），自動拆成 7 句 + 8 句重掃"
+            ),
+            "初始 Coding 候選過少重掃",
+        )
 
 
 if __name__ == "__main__":
