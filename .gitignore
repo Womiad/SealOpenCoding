@@ -1,0 +1,5 @@
+/testing_txt/
+/output/
+/seal_code_reader/
+__pycache__/
+*.py[cod]
