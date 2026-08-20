@@ -33,6 +33,22 @@ class OpenCodingTests(unittest.TestCase):
         self.assertEqual(target.context_before.count("【S"), 6)
         self.assertEqual(target.context_after.count("【S"), 6)
 
+    def test_plus_turn_marker_is_preserved_without_assuming_role(self):
+        segments = open_coding.segment_transcript("+ 這是帶有加號的合成發言。")
+        self.assertEqual(segments[0].speaker, "講者（+標記）")
+        self.assertEqual(segments[0].text, "這是帶有加號的合成發言。")
+
+    def test_timestamp_colon_is_not_parsed_as_speaker(self):
+        segments = open_coding.segment_transcript("2026/1/2 13:05-14:11")
+        self.assertEqual(segments[0].speaker, "")
+        self.assertEqual(segments[0].text, "2026/1/2 13:05-14:11")
+
+    def test_colon_after_sentence_is_not_parsed_as_speaker(self):
+        source = "這是一段較長的合成說明。接著顯示時間12:34"
+        segments = open_coding.segment_transcript(source)
+        self.assertEqual(segments[0].speaker, "")
+        self.assertIn("合成說明", segments[0].text)
+
     def test_selected_evidence_context_is_source_grounded_and_flexible(self):
         text = "\n".join([
             "提問者：無關測試句。", "提問者：合成情境甲。", "參與者：合成行動乙。",
@@ -60,6 +76,58 @@ class OpenCodingTests(unittest.TestCase):
             "code": "錯誤測試 code", "rationale": "錯誤測試理由", "confidence": 0.9,
         }]}
         self.assertEqual(open_coding.validate_codings(result, segments), [])
+
+    def test_evidence_refinement_moves_primary_and_keeps_long_relevant_episode(self):
+        text = "\n".join([
+            "提問者：請先想像一個合成情境。",
+            "提問者：你會怎麼處理這個合成事件？",
+            "+ 我會先執行合成步驟甲。",
+            "+ 接著觀察合成結果乙。",
+            "提問者：這會改變你的選擇嗎？",
+            "+ 因為結果乙符合條件，所以我會採用方案丙。",
+        ])
+        segments = open_coding.segment_transcript(text, context_radius=6)
+        primary = segments[1]
+        codings = [{
+            "segment_id": primary.id,
+            "supporting_segment_ids": [primary.id],
+            "evidence_context": primary.full_context,
+            "evidence_quote": primary.text,
+            "code": "在合成事件中，參與者依觀察結果形成條件式選擇。",
+            "rationale": "完整事件支持此 code。",
+            "full_context": primary.full_context,
+            "context_before": primary.context_before,
+            "context_after": primary.context_after,
+        }]
+        model_result = {"contexts": [{
+            "candidate_id": "C00001",
+            "primary_segment_id": "S000006",
+            "supporting_segment_ids": [f"S{i:06d}" for i in range(1, 7)],
+            "reason": "六句共同構成情境、行動、觀察與選擇。",
+        }]}
+        args = Namespace(host="local", model="test", timeout=10)
+        with patch.object(open_coding, "ollama_chat", return_value=model_result):
+            rows = open_coding.refine_evidence_ranges("合成研究規則", codings, segments, args)
+        self.assertEqual(rows[0]["segment_id"], "S000006")
+        self.assertEqual(len(rows[0]["supporting_segment_ids"]), 6)
+        self.assertIn("合成步驟甲", rows[0]["evidence_context"])
+        self.assertEqual(rows[0]["evidence_quote"], segments[5].text)
+
+    def test_invalid_evidence_refinement_preserves_existing_context(self):
+        segments = open_coding.segment_transcript("參與者：這是一句完整的合成經驗陳述。")
+        original = {
+            "segment_id": "S000001", "supporting_segment_ids": ["S000001"],
+            "evidence_context": segments[0].full_context, "evidence_quote": segments[0].text,
+            "code": "合成 code", "rationale": "合成理由", "full_context": segments[0].full_context,
+        }
+        result = {"contexts": [{
+            "candidate_id": "C00001", "primary_segment_id": "S999999",
+            "supporting_segment_ids": ["S999999"], "reason": "無效測試",
+        }]}
+        args = Namespace(host="local", model="test", timeout=10)
+        with patch.object(open_coding, "ollama_chat", return_value=result):
+            rows = open_coding.refine_evidence_ranges("合成研究規則", [original], segments, args)
+        self.assertEqual(rows[0], original)
 
     def test_short_agreement_is_rejected(self):
         segments = open_coding.segment_transcript("提問者：合成問題？\n參與者：+對")
@@ -135,7 +203,11 @@ class OpenCodingTests(unittest.TestCase):
                             "characteristics": [], "interview_summary": "合成測試摘要。"},
                 "research_directions": [],
             }
-            with patch.object(open_coding, "ollama_chat", side_effect=[coding_result, synthesis_result]):
+            context_result = {"contexts": [{
+                "candidate_id": "C00001", "primary_segment_id": "S000001",
+                "supporting_segment_ids": ["S000001"], "reason": "單句已完整。",
+            }]}
+            with patch.object(open_coding, "ollama_chat", side_effect=[coding_result, context_result, synthesis_result]):
                 output, count = open_coding.code_file(source, "合成研究規則", args)
             self.assertEqual(count, 1)
             with output.open(encoding="utf-8-sig", newline="") as handle:
@@ -159,6 +231,7 @@ class OpenCodingTests(unittest.TestCase):
         self.assertGreaterEqual(len(open_coding_gui.SEAL_THINKING_LINES), 30)
         self.assertEqual(open_coding_gui.format_elapsed(3661.9), "01:01:01")
         self.assertEqual(open_coding_gui.status_context_for_log("初選 2/5：20 個候選"), "篩選階段 初選 2/5")
+        self.assertEqual(open_coding_gui.status_context_for_log("語證範圍校正 2/3：8 個 code"), "語證校正 2/3")
 
 
 if __name__ == "__main__":

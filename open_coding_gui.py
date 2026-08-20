@@ -23,7 +23,7 @@ SCRIPT = APP_DIR / "open_coding.py"
 ICON = APP_DIR / "seal_open_coding_icon.png"
 READER_ICON = APP_DIR / "seal_code_reader_icon.png"
 APP_NAME = "海豹牌 Open Coding 工具"
-APP_VERSION = "V1.2"
+APP_VERSION = "V1.3"
 FILE_TYPES = [
     ("支援的文檔", "*.txt *.md *.docx"),
     ("文字檔", "*.txt"),
@@ -165,6 +165,7 @@ def seal_companion_for_log(message: str, rotation_index: int = 0) -> str | None:
         (("初選",), "🦭 海豹把太細、無關和理所當然的 code 輕輕撥開。"),
         (("跨批比較",), "🦭 海豹把整篇線索放在一起，尋找反覆模式與特別觀點。"),
         (("聚焦精選完成",), "🦭 海豹留下比較有分析價值的 code。"),
+        (("語證範圍校正",), "🦭 海豹沿著每筆 code 往前後游，只帶回真正相關的上下文。"),
         (("品質門檻後只有",), "🦭 海豹寧可少留幾個，也不拿無關 code 湊數。"),
         (("完成：",), "🦭✓ 海豹整理完成，CSV 已經安全放好了。"),
         (("失敗：",), "🦭❌ 海豹處理這篇時遇到問題，請查看上方訊息。"),
@@ -193,6 +194,9 @@ def status_context_for_log(message: str) -> str | None:
         return "篩選階段 完成"
     if "改用 code 分數" in text:
         return "篩選階段 分數回退"
+    if "語證範圍校正" in text:
+        match = re.search(r"語證範圍校正\s+(\d+)/(\d+)", text)
+        return f"語證校正 {match.group(1)}/{match.group(2)}" if match else "語證校正 完成"
     if "文本簡介與研究方向" in text:
         return "文本簡介與研究方向"
     if "區塊" in text and "/" in text:
@@ -652,7 +656,7 @@ class OpenCodingGUI(tk.Tk):
         ttk.Label(settings, text="前後各最多幾句；輸出只顯示自動判定相關的句子", foreground="#555555").grid(row=1, column=4, columnspan=4, sticky="w", pady=(7, 0))
         ttk.Label(
             settings,
-            text="V1.2 會逐筆選出真正支持 code 的彈性上下文；上限較大可捕捉較長體驗，但會稍慢。",
+            text="V1.3 會在精選後校正每筆 code 的主句與彈性上下文；上限較大可捕捉較長體驗，但會稍慢。",
             foreground="#555555",
         ).grid(row=2, column=0, columnspan=8, sticky="w", pady=(7, 0))
 

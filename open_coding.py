@@ -28,9 +28,25 @@ SUPPORTED = {".txt", ".md", ".docx"}
 SENTENCE_END = re.compile(r"(?<=[。！？!?；;])\s*|(?<=[.])\s+(?=[A-Z0-9\[（(])")
 SPEAKER = re.compile(r"^\s*([^：:\n]{1,30})[：:]\s*(.*)$")
 RESPONDENT_DASH = re.compile(r"^\s*[-–—]\s*(.+)$")
+TURN_PLUS = re.compile(r"^\s*\+\s*(.+)$")
 MINIMAL_RESPONSE = re.compile(
     r"^(?:嗯+|好+|對+|是+|否|不是|有|無|沒有|會|不會|可以|不可以|還好)[，,。.!！?？\s]*$"
 )
+
+
+def _is_speaker_label(value: str) -> bool:
+    """Distinguish a compact speaker tag from an in-sentence colon/time."""
+    label = value.strip()
+    if not label or len(label) > 12:
+        return False
+    if re.search(r"[。！？!?；;，,./]", label):
+        return False
+    if re.search(r"\d", label):
+        return bool(
+            re.fullmatch(r"[A-Za-z]{1,3}\d{1,3}", label)
+            or re.fullmatch(r"(?:受訪者|訪員|訪談者|研究者|參與者|主持人)\d{1,3}", label)
+        )
+    return bool(re.fullmatch(r"[\w\u3400-\u9fff（）() -]+", label))
 
 
 @dataclass(frozen=True)
@@ -85,12 +101,18 @@ def segment_transcript(text: str, context_radius: int = 6) -> list[Segment]:
         if not line:
             continue
         dash_match = RESPONDENT_DASH.match(line)
+        plus_match = TURN_PLUS.match(line)
         match = SPEAKER.match(line)
-        if dash_match:
+        if plus_match:
+            # A leading plus is also used as a turn marker in some exports.
+            # It is deliberately preserved as a generic speaker marker: the
+            # research role must come from the guide or the surrounding talk.
+            speaker, content = "講者（+標記）", plus_match.group(1).strip()
+        elif dash_match:
             # A leading dash distinguishes a speaker/turn in some transcript
             # formats, but does not identify that person's research role.
             speaker, content = "講者（-標記）", dash_match.group(1).strip()
-        elif match:
+        elif match and _is_speaker_label(match.group(1)):
             speaker, content = match.group(1).strip(), match.group(2).strip()
         else:
             speaker, content = "", line
@@ -185,7 +207,7 @@ code 必須從受訪者實際說法歸納，不得把指引中的詞機械套入
 
 逐一掃描每個 segment。優先 coding 受訪者的經驗、行動、感受、評價、需求、顧慮、選擇與因應方式。
 若 speaker 是「訪員／研究者」，不要 coding。若 speaker 空白且內容主要是提問、功能介紹、流程說明或引導語，也不要 coding。
-逐字稿中的「講者（-標記）」只表示原文以破折號標示該講者，不代表受訪者、訪員、病人、陪伴者或家屬。
+逐字稿中的「講者（+標記）」與「講者（-標記）」只表示原文以符號標示一次發言，不代表受訪者、訪員、病人、陪伴者或家屬。
 只有 speaker 欄明確寫出角色時才能依角色判斷；角色未明時，依發言內容區分經驗陳述與訪談提問，不得從破折號推測角色。
 缺少理由、條件或具體經驗的簡短同意不可單獨 coding；不得用訪員問題替短答補出需求或態度。
 code 必須同時受目標原文與 full_context 支持；不得把訪員的假設當作講者已經歷的事實。
@@ -347,7 +369,8 @@ def looks_like_interviewer_turn(segment: Segment) -> bool:
     text = segment.text.strip()
     if segment.speaker in {"訪員", "訪談者", "研究者", "主持人"}:
         return True
-    if segment.speaker:
+    generic_marker = segment.speaker in {"講者（+標記）", "講者（-標記）"}
+    if segment.speaker and not generic_marker:
         return False
     if re.search(r"(?:我們|本研究|這個).{0,16}(?:系統|工具|功能|產品).{0,12}(?:會|可以|提供)", text):
         return True
@@ -382,6 +405,155 @@ def selected_evidence_context(segment: Segment, requested_ids: object) -> tuple[
         selected_ids.sort(key=order.index)
     evidence_context = "\n".join(available[value] for value in selected_ids)
     return selected_ids, evidence_context
+
+
+def _context_ids(text: str) -> list[str]:
+    """Return source IDs visible in a stored context window, in source order."""
+    ids: list[str] = []
+    for line in str(text).splitlines():
+        match = CONTEXT_SEGMENT.match(line)
+        if match and match.group(1) not in ids:
+            ids.append(match.group(1))
+    return ids
+
+
+def _evidence_text_from_ids(
+    requested_ids: object,
+    primary_id: str,
+    visible_ids: set[str],
+    segments: list[Segment],
+) -> tuple[list[str], str]:
+    """Rebuild selected context from document source, never model-authored text."""
+    requested = [str(value) for value in requested_ids] if isinstance(requested_ids, list) else []
+    wanted = {value for value in requested if value in visible_ids}
+    wanted.add(primary_id)
+    selected = [segment for segment in segments if segment.id in wanted]
+    ids = [segment.id for segment in selected]
+    lines = [f"【{segment.id}｜{segment.speaker or '未標記講者'}】{segment.text}" for segment in selected]
+    return ids, "\n".join(lines)
+
+
+def refine_evidence_ranges(
+    guide: str,
+    codings: list[dict],
+    segments: list[Segment],
+    args: argparse.Namespace,
+) -> list[dict]:
+    """Correct each code's primary quote and flexibly select necessary context.
+
+    Initial and focused coding optimize code quality. This separate, optional
+    pass asks the model only where the supporting episode begins and ends. All
+    returned IDs are validated and joined back to the original transcript.
+    A failed batch preserves its existing rows so overnight jobs keep going.
+    """
+    if not codings:
+        return codings
+    by_segment = {segment.id: segment for segment in segments}
+    batch_size = 5
+    batches = [codings[index:index + batch_size] for index in range(0, len(codings), batch_size)]
+    corrected: list[dict] = []
+
+    system = """你是質性研究的語證校對者。code 已經決定；你的工作只是在逐字稿可見範圍內，選出真正支持每個 code 的彈性上下文。
+
+每筆都要重新判斷：
+1. primary_segment_id 必須是參與者自己的實質經驗、想法、行為或評價所在句；訪員的問題、功能介紹、重述或總結只能當 supporting context，不能當主句。若 current primary 是問「你／您」的問句，絕不可原樣選回，必須在可見範圍尋找後續實質回答。
+2. 先把 code 拆成「情境／前因、想法或行動、理由、結果、比較或界線」等實際存在的部分，再逐項確認是哪個原句支持。code 是先前綜合上下文寫成的分析句，不能因為 code 本身很完整，就假定 current primary 一句已經支持全部內容。
+3. supporting_segment_ids 只保留理解 code 必要的句子，並包含 primary。只有同一句明確包含 code 的所有實質部分時才能只選一句；若不同句分別提供情境、操作、反應、理由、比較或評價，必須全部選入。「功能說明／實際體驗 → 反應 → 理由／比較 → 評價」的長事件通常需要 5 句以上。
+4. 參與者使用「這個、那個、這樣、會、不會、對」等依賴前文的回答時，必須納入讓指涉可理解的問題或功能情境；比較兩種經驗時，必須納入被比較的兩側證據。
+5. 不要機械地取前後固定句數。每一句都要與 code 的情境、行動、理由或結果直接相關；移除後不影響理解的寒暄、換題或枝節不要選。
+6. 「講者（+標記）」與「講者（-標記）」都只是原稿的發言標記，不自動代表任何研究角色。依發言內容、研究指引及對話關係判斷。
+7. 只能使用該 candidate 的 visible_segment_ids，不得創造 ID，也不得改寫 code 或原文。supporting_segments 要為每個選入 ID 標明它提供的語證功能，不能填籠統的「相關」。
+
+只輸出 JSON：
+{"contexts":[{"candidate_id":"C00001","primary_segment_id":"S000001","supporting_segment_ids":["S000001"],"supporting_segments":[{"segment_id":"S000001","function":"想法或行動"}],"reason":"逐項說明 code 的哪些部分由哪些句子支持，以及為何邊界到此為止"}]}"""
+
+    for batch_index, batch in enumerate(batches, 1):
+        candidates: list[dict] = []
+        candidate_rows: dict[str, dict] = {}
+        visible_by_candidate: dict[str, set[str]] = {}
+        for local_index, coding in enumerate(batch, 1):
+            candidate_id = f"C{local_index:05d}"
+            visible = _context_ids(coding.get("full_context", ""))
+            if coding.get("segment_id") not in visible:
+                visible.append(str(coding.get("segment_id", "")))
+            visible = [value for value in visible if value in by_segment]
+            candidate_rows[candidate_id] = coding
+            visible_by_candidate[candidate_id] = set(visible)
+            candidates.append({
+                "candidate_id": candidate_id,
+                "current_primary_segment_id": coding.get("segment_id", ""),
+                "current_supporting_segment_ids": coding.get("supporting_segment_ids", []),
+                "code": coding.get("code", ""),
+                "why_this_code": coding.get("rationale", ""),
+                "visible_segment_ids": visible,
+                "visible_context": coding.get("full_context", ""),
+            })
+
+        print(f"  語證範圍校正 {batch_index}/{len(batches)}：{len(batch)} 個 code", flush=True)
+        prompt = (
+            "研究指引（只用來辨識研究角色與研究情境，不可擴張原文）：\n"
+            f"---\n{guide}\n---\n\n待校正資料：\n"
+            + json.dumps(candidates, ensure_ascii=False)
+        )
+        try:
+            result = ollama_chat(args.host, args.model, system, prompt, args.timeout)
+            contexts = result.get("contexts", [])
+            if not isinstance(contexts, list):
+                raise RuntimeError("語證校正結果的 contexts 必須是陣列")
+        except RuntimeError as exc:
+            print(f"    警告：語證範圍校正失敗，保留原範圍並繼續：{exc}", flush=True)
+            corrected.extend(batch)
+            continue
+
+        proposals = {
+            str(item.get("candidate_id", "")): item
+            for item in contexts if isinstance(item, dict)
+        }
+        for candidate_id, original in candidate_rows.items():
+            proposal = proposals.get(candidate_id)
+            if proposal is None:
+                corrected.append(original)
+                continue
+            primary_id = str(proposal.get("primary_segment_id", ""))
+            visible_ids = visible_by_candidate[candidate_id]
+            primary = by_segment.get(primary_id)
+            normalized = re.sub(r"^[+\-–—\s]+", "", primary.text.strip()) if primary else ""
+            meaningful = re.sub(r"[^\w\u3400-\u9fff]", "", normalized)
+            if (
+                primary is None
+                or primary_id not in visible_ids
+                or len(meaningful) < 6
+                or MINIMAL_RESPONSE.fullmatch(normalized)
+                or looks_like_interviewer_turn(primary)
+            ):
+                corrected.append(original)
+                continue
+            requested_support = proposal.get("supporting_segment_ids", [])
+            if not isinstance(requested_support, list):
+                requested_support = []
+            detailed_support = proposal.get("supporting_segments", [])
+            if isinstance(detailed_support, list):
+                requested_support.extend(
+                    item.get("segment_id") for item in detailed_support if isinstance(item, dict)
+                )
+            supporting_ids, evidence_context = _evidence_text_from_ids(
+                requested_support,
+                primary_id,
+                visible_ids,
+                segments,
+            )
+            row = dict(original)
+            row.update({
+                "segment_id": primary_id,
+                "supporting_segment_ids": supporting_ids,
+                "evidence_context": evidence_context,
+                "evidence_quote": primary.text,
+                "context_before": primary.context_before,
+                "context_after": primary.context_after,
+                "full_context": primary.full_context,
+            })
+            corrected.append(row)
+    return corrected
 
 
 def validate_codings(
@@ -952,6 +1124,10 @@ def code_file(
         print(f"  聚焦精選：比較整份訪談的 {initial_count} 個候選 code…", flush=True)
         all_codings = refine_codings(guide, all_codings, args)
         print(f"  聚焦精選完成：保留 {len(all_codings)} 個具分析價值的 code。", flush=True)
+
+    if all_codings:
+        all_codings = refine_evidence_ranges(guide, all_codings, segments, args)
+        print("  語證範圍校正完成：已依每筆 code 重選必要上下文。", flush=True)
 
     count_explanation = code_count_explanation(
         minimum=max(0, int(getattr(args, "min_codes", 10))),
