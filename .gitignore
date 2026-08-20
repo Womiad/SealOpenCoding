@@ -1,5 +1,82 @@
-/testing_txt/
-/output/
-/seal_code_reader/
+# Python / local build artifacts
 __pycache__/
 *.py[cod]
+.venv/
+venv/
+build/
+dist/
+*.log
+*.tmp
+*.bak
+
+# Local nested app checkout
+/seal_code_reader/
+
+# Research inputs and generated coding outputs
+testing_txt/
+transcripts/
+interviews/
+research_data/
+private_data/
+participant_data/
+coding_output/
+output/
+output_*/
+*_output/
+*_open_coding.csv
+*.csv
+*.tsv
+*.xlsx
+*.xls
+
+# Common transcript / participant filename conventions
+[Ss][0-9][0-9]*.txt
+[Ss][0-9][0-9]*.md
+[Ss][0-9][0-9]*.docx
+[Tt][0-9][0-9]*.txt
+[Tt][0-9][0-9]*.md
+[Tt][0-9][0-9]*.docx
+*transcript*.txt
+*transcript*.md
+*transcript*.docx
+*interview*.txt
+*interview*.md
+*interview*.docx
+*逐字稿*.txt
+*逐字稿*.md
+*逐字稿*.docx
+*訪談*.txt
+*訪談*.md
+*訪談*.docx
+
+# Private research guides/codebooks selected at runtime
+codebook*.txt
+codebook*.md
+codebook*.docx
+research_guide*.txt
+research_guide*.md
+research_guide*.docx
+*_research_guide.*
+*_codebook.*
+!/CODEBOOK_GUIDE_V*.md
+
+# Audio/video, documents and archives can contain raw participant data
+*.wav
+*.mp3
+*.m4a
+*.flac
+*.ogg
+*.mp4
+*.mov
+*.docx
+*.pdf
+*.zip
+*.7z
+
+# Credentials and local configuration
+.env
+.env.*
+*.pem
+*.key
+credentials.*
+secrets.*

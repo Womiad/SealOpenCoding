@@ -113,7 +113,7 @@ class OpenCodingTests(unittest.TestCase):
         self.assertIn("合成步驟甲", rows[0]["evidence_context"])
         self.assertEqual(rows[0]["evidence_quote"], segments[5].text)
 
-    def test_invalid_evidence_refinement_preserves_existing_context(self):
+    def test_invalid_new_primary_falls_back_to_existing_primary(self):
         segments = open_coding.segment_transcript("參與者：這是一句完整的合成經驗陳述。")
         original = {
             "segment_id": "S000001", "supporting_segment_ids": ["S000001"],
@@ -127,7 +127,76 @@ class OpenCodingTests(unittest.TestCase):
         args = Namespace(host="local", model="test", timeout=10)
         with patch.object(open_coding, "ollama_chat", return_value=result):
             rows = open_coding.refine_evidence_ranges("合成研究規則", [original], segments, args)
-        self.assertEqual(rows[0], original)
+        self.assertEqual(rows[0]["segment_id"], original["segment_id"])
+        self.assertEqual(rows[0]["evidence_quote"], original["evidence_quote"])
+
+    def test_evidence_refinement_adds_topic_anchor_and_excludes_next_topic(self):
+        segments = open_coding.segment_transcript("\n".join([
+            "提問者：使用合成功能甲之後，你如何評價它？",
+            "+ 合成功能甲讓我比較容易完成測試任務。",
+            "那我們接下來問合成功能乙的使用情況。",
+        ]), context_radius=12)
+        primary = segments[1]
+        original = {
+            "segment_id": primary.id, "supporting_segment_ids": [primary.id],
+            "evidence_context": primary.full_context, "evidence_quote": primary.text,
+            "code": "體驗合成功能甲後，參與者認為它降低任務難度。",
+            "rationale": "原句提供功能評價。", "full_context": primary.full_context,
+        }
+        result = {"contexts": [{
+            "candidate_id": "C00001", "primary_segment_id": primary.id,
+            "supporting_segment_ids": ["S000002", "S000003"],
+            "supporting_segments": [], "reason": "合成模型範圍。",
+        }]}
+        args = Namespace(host="local", model="test", timeout=10)
+        with patch.object(open_coding, "ollama_chat", return_value=result):
+            rows = open_coding.refine_evidence_ranges("合成研究規則", [original], segments, args)
+        self.assertEqual(rows[0]["supporting_segment_ids"], ["S000001", "S000002"])
+        self.assertIn("合成功能甲之後", rows[0]["evidence_context"])
+        self.assertNotIn("合成功能乙", rows[0]["evidence_context"])
+
+    def test_interviewer_paraphrase_without_question_mark_is_rejected(self):
+        segments = open_coding.segment_transcript("你覺得合成紀錄沒有幫助")
+        result = {"codings": [{
+            "segment_id": "S000001", "evidence_quote": "你覺得合成紀錄沒有幫助",
+            "code": "錯把訪員重述當成參與者觀點", "rationale": "合成測試", "confidence": 0.9,
+        }]}
+        self.assertEqual(open_coding.validate_codings(result, segments), [])
+
+    def test_minimum_context_floor_reaches_five_without_crossing_topic_switch(self):
+        segments = open_coding.segment_transcript("\n".join([
+            "提問者：請說明合成主題甲的完整體驗？",
+            "參與者：先發生合成情境一。",
+            "參與者：接著採取合成行動二。",
+            "參與者：然後觀察合成結果三。",
+            "參與者：最後形成一個完整評價。",
+            "那我們接下來問合成主題乙。",
+        ]), context_radius=12)
+        ids = open_coding._ensure_minimum_context_ids(
+            ["S000005"], "S000005", {item.id for item in segments}, segments, 5
+        )
+        self.assertEqual(ids, [f"S{i:06d}" for i in range(1, 6)])
+        self.assertNotIn("S000006", ids)
+
+    def test_context_floor_still_applies_when_refinement_times_out(self):
+        segments = open_coding.segment_transcript("\n".join([
+            "提問者：請說明合成主題甲的完整體驗？",
+            "參與者：先發生合成情境一。",
+            "參與者：接著採取合成行動二。",
+            "參與者：然後觀察合成結果三。",
+            "參與者：最後形成一個完整評價。",
+        ]), context_radius=12)
+        primary = segments[4]
+        original = {
+            "segment_id": primary.id, "supporting_segment_ids": [primary.id],
+            "evidence_context": primary.text, "evidence_quote": primary.text,
+            "code": "合成主題甲形成完整評價。", "rationale": "合成理由",
+            "full_context": primary.full_context,
+        }
+        args = Namespace(host="local", model="test", timeout=1, min_context_segments=5)
+        with patch.object(open_coding, "ollama_chat", side_effect=RuntimeError("模型請求逾時（1 秒）")):
+            rows = open_coding.refine_evidence_ranges("合成研究規則", [original], segments, args)
+        self.assertEqual(len(rows[0]["supporting_segment_ids"]), 5)
 
     def test_short_agreement_is_rejected(self):
         segments = open_coding.segment_transcript("提問者：合成問題？\n參與者：+對")

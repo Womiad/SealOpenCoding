@@ -372,11 +372,34 @@ def looks_like_interviewer_turn(segment: Segment) -> bool:
     generic_marker = segment.speaker in {"講者（+標記）", "講者（-標記）"}
     if segment.speaker and not generic_marker:
         return False
+    if re.match(r"^(?:那|所以|還是)?\s*(?:你|您)(?:覺得|認為|會|想|願意|有沒有|知不知道|是否)", text):
+        return True
+    if not segment.speaker and text.endswith(("?", "？")):
+        return True
     if re.search(r"(?:我們|本研究|這個).{0,16}(?:系統|工具|功能|產品).{0,12}(?:會|可以|提供)", text):
         return True
     if ("?" in text or "？" in text) and re.search(r"(?:你|您|會不會|有沒有|覺得|願意|想不想)", text):
         return True
     return False
+
+
+def looks_like_topic_switch(segment: Segment) -> bool:
+    """Recognize a clear transition into the next interview topic."""
+    text = segment.text.strip()
+    return bool(re.match(r"^(?:好[，,。\s]*)?(?:那[，,。\s]*)?(?:我們)?接下來(?:想|要|會|問|看|進入|來)", text))
+
+
+def is_valid_primary_evidence(segment: Segment | None) -> bool:
+    """Require a substantive, non-interviewer segment as the main evidence."""
+    if segment is None:
+        return False
+    normalized = re.sub(r"^[+\-–—\s]+", "", segment.text.strip())
+    meaningful = re.sub(r"[^\w\u3400-\u9fff]", "", normalized)
+    return bool(
+        len(meaningful) >= 6
+        and not MINIMAL_RESPONSE.fullmatch(normalized)
+        and not looks_like_interviewer_turn(segment)
+    )
 
 
 CONTEXT_SEGMENT = re.compile(r"^【(?:目標片段 )?(S\d{6})｜[^】]*】(.*)$")
@@ -433,6 +456,115 @@ def _evidence_text_from_ids(
     return ids, "\n".join(lines)
 
 
+def _ensure_minimum_context_ids(
+    requested_ids: list[object],
+    primary_id: str,
+    visible_ids: set[str],
+    segments: list[Segment],
+    minimum: int,
+) -> list[str]:
+    """Fill a small readable context floor without crossing the next topic."""
+    visible = [segment for segment in segments if segment.id in visible_ids]
+    primary_index = next((index for index, item in enumerate(visible) if item.id == primary_id), -1)
+    if primary_index < 0:
+        return [str(value) for value in requested_ids]
+    cutoff = len(visible)
+    for index in range(primary_index + 1, len(visible)):
+        if looks_like_topic_switch(visible[index]):
+            cutoff = index
+            break
+    allowed = {segment.id for segment in visible[:cutoff]}
+    wanted = {str(value) for value in requested_ids if str(value) in allowed}
+    wanted.add(primary_id)
+    floor = max(1, minimum)
+    if len(wanted) < floor:
+        # Preceding turns are most useful for recovering the question/topic.
+        # Only after they are exhausted do we include later reactions/results.
+        candidates = list(reversed(visible[:primary_index])) + visible[primary_index + 1:cutoff]
+        for segment in candidates:
+            wanted.add(segment.id)
+            if len(wanted) >= floor:
+                break
+    return [segment.id for segment in visible if segment.id in wanted]
+
+
+def _topic_anchor_id(
+    primary_id: str,
+    visible_ids: set[str],
+    segments: list[Segment],
+    code: str = "",
+) -> str:
+    """Find a prior turn that tells a reader what topic is being discussed."""
+    visible = [segment for segment in segments if segment.id in visible_ids]
+    primary_index = next((index for index, item in enumerate(visible) if item.id == primary_id), -1)
+    if primary_index <= 0:
+        return ""
+    code_chars = re.sub(r"[^\w\u3400-\u9fff]", "", code)
+    code_bigrams = {code_chars[index:index + 2] for index in range(max(0, len(code_chars) - 1))}
+    micro_probe = re.compile(r"^(?:為什麼|幾分|還有嗎|對嗎|是嗎|所以呢|然後呢)[？?。\s]*$")
+    question_cue = re.compile(
+        r"(?:你|您).{0,14}(?:覺得|認為|會|想|願意|有沒有|會不會|是否|怎麼|什麼|幾分|為什麼)"
+    )
+    topic_intro = re.compile(
+        r"^(?:好[，,。\s]*)?(?:那[，,。\s]*)?(?:我們|接下來|關於|假設|如果|請問|想問|這個|這項|這部分)"
+    )
+    scored: list[tuple[int, int, str]] = []
+    for index, segment in enumerate(visible[:primary_index]):
+        text = segment.text.strip()
+        meaningful = re.sub(r"[^\w\u3400-\u9fff]", "", text)
+        if len(meaningful) < 6 or MINIMAL_RESPONSE.fullmatch(meaningful):
+            continue
+        bigrams = {meaningful[offset:offset + 2] for offset in range(max(0, len(meaningful) - 1))}
+        overlap = len(code_bigrams & bigrams)
+        question_score = 5 if text.endswith(("?", "？")) or question_cue.search(text) else 0
+        intro_score = 4 if topic_intro.search(text) or looks_like_interviewer_turn(segment) else 0
+        probe_penalty = 5 if micro_probe.fullmatch(text) else 0
+        distance = primary_index - index
+        recency = max(0, 4 - distance // 3)
+        score = overlap * 2 + question_score + intro_score + recency - probe_penalty
+        scored.append((score, index, segment.id))
+    if not scored:
+        return ""
+    best_score, _, best_id = max(scored)
+    return best_id if best_score > 0 else scored[-1][2]
+
+
+def _fallback_evidence_range(
+    coding: dict,
+    segments: list[Segment],
+    minimum: int,
+) -> dict:
+    """Apply the topic anchor/context floor even when the LLM pass fails."""
+    by_segment = {segment.id: segment for segment in segments}
+    primary_id = str(coding.get("segment_id", ""))
+    primary = by_segment.get(primary_id)
+    if not is_valid_primary_evidence(primary):
+        return coding
+    visible = set(_context_ids(coding.get("full_context", "")))
+    visible.add(primary_id)
+    anchor = _topic_anchor_id(primary_id, visible, segments, str(coding.get("code", "")))
+    requested = coding.get("supporting_segment_ids", [])
+    requested = list(requested) if isinstance(requested, list) else []
+    if anchor:
+        requested.append(anchor)
+    requested = _ensure_minimum_context_ids(
+        requested, primary_id, visible, segments, max(1, minimum)
+    )
+    supporting_ids, evidence_context = _evidence_text_from_ids(
+        requested, primary_id, visible, segments
+    )
+    row = dict(coding)
+    row.update({
+        "supporting_segment_ids": supporting_ids,
+        "evidence_context": evidence_context,
+        "evidence_quote": primary.text,
+        "context_before": primary.context_before,
+        "context_after": primary.context_after,
+        "full_context": primary.full_context,
+    })
+    return row
+
+
 def refine_evidence_ranges(
     guide: str,
     codings: list[dict],
@@ -449,6 +581,7 @@ def refine_evidence_ranges(
     if not codings:
         return codings
     by_segment = {segment.id: segment for segment in segments}
+    document_order = {segment.id: index for index, segment in enumerate(segments)}
     batch_size = 5
     batches = [codings[index:index + batch_size] for index in range(0, len(codings), batch_size)]
     corrected: list[dict] = []
@@ -460,9 +593,11 @@ def refine_evidence_ranges(
 2. 先把 code 拆成「情境／前因、想法或行動、理由、結果、比較或界線」等實際存在的部分，再逐項確認是哪個原句支持。code 是先前綜合上下文寫成的分析句，不能因為 code 本身很完整，就假定 current primary 一句已經支持全部內容。
 3. supporting_segment_ids 只保留理解 code 必要的句子，並包含 primary。只有同一句明確包含 code 的所有實質部分時才能只選一句；若不同句分別提供情境、操作、反應、理由、比較或評價，必須全部選入。「功能說明／實際體驗 → 反應 → 理由／比較 → 評價」的長事件通常需要 5 句以上。
 4. 參與者使用「這個、那個、這樣、會、不會、對」等依賴前文的回答時，必須納入讓指涉可理解的問題或功能情境；比較兩種經驗時，必須納入被比較的兩側證據。
-5. 不要機械地取前後固定句數。每一句都要與 code 的情境、行動、理由或結果直接相關；移除後不影響理解的寒暄、換題或枝節不要選。
-6. 「講者（+標記）」與「講者（-標記）」都只是原稿的發言標記，不自動代表任何研究角色。依發言內容、研究指引及對話關係判斷。
-7. 只能使用該 candidate 的 visible_segment_ids，不得創造 ID，也不得改寫 code 或原文。supporting_segments 要為每個選入 ID 標明它提供的語證功能，不能填籠統的「相關」。
+5. 每筆至少要有一個「討論主題錨點」：讓未讀逐字稿的人只看 evidence_context，也能知道正在談哪個功能、經驗、事件或問題。通常是前面最近一個完整提問或題目介紹；只有 primary 自己已明確說出討論對象時才可省略。
+6. 不要把已切換到下一題的句子倒收進目前 code。看到「接下來問／接下來想知道／進入下一部分」等轉場後，後面的新題目不屬於前一筆 code。
+7. 不要機械地取前後固定句數。每一句都要負責交代討論主題、code 的情境、行動、理由或結果；移除後不影響理解的寒暄、重複或枝節不要選。
+8. 「講者（+標記）」與「講者（-標記）」都只是原稿的發言標記，不自動代表任何研究角色。依發言內容、研究指引及對話關係判斷。
+9. 只能使用該 candidate 的 visible_segment_ids，不得創造 ID，也不得改寫 code 或原文。supporting_segments 要為每個選入 ID 標明「主題錨點／情境／行動／理由／結果／比較」等功能，不能填籠統的「相關」。
 
 只輸出 JSON：
 {"contexts":[{"candidate_id":"C00001","primary_segment_id":"S000001","supporting_segment_ids":["S000001"],"supporting_segments":[{"segment_id":"S000001","function":"想法或行動"}],"reason":"逐項說明 code 的哪些部分由哪些句子支持，以及為何邊界到此為止"}]}"""
@@ -502,7 +637,12 @@ def refine_evidence_ranges(
                 raise RuntimeError("語證校正結果的 contexts 必須是陣列")
         except RuntimeError as exc:
             print(f"    警告：語證範圍校正失敗，保留原範圍並繼續：{exc}", flush=True)
-            corrected.extend(batch)
+            corrected.extend(
+                _fallback_evidence_range(
+                    coding, segments, int(getattr(args, "min_context_segments", 5))
+                )
+                for coding in batch
+            )
             continue
 
         proposals = {
@@ -512,22 +652,21 @@ def refine_evidence_ranges(
         for candidate_id, original in candidate_rows.items():
             proposal = proposals.get(candidate_id)
             if proposal is None:
-                corrected.append(original)
+                corrected.append(_fallback_evidence_range(
+                    original, segments, int(getattr(args, "min_context_segments", 5))
+                ))
                 continue
             primary_id = str(proposal.get("primary_segment_id", ""))
             visible_ids = visible_by_candidate[candidate_id]
             primary = by_segment.get(primary_id)
-            normalized = re.sub(r"^[+\-–—\s]+", "", primary.text.strip()) if primary else ""
-            meaningful = re.sub(r"[^\w\u3400-\u9fff]", "", normalized)
-            if (
-                primary is None
-                or primary_id not in visible_ids
-                or len(meaningful) < 6
-                or MINIMAL_RESPONSE.fullmatch(normalized)
-                or looks_like_interviewer_turn(primary)
-            ):
-                corrected.append(original)
-                continue
+            if primary_id not in visible_ids or not is_valid_primary_evidence(primary):
+                primary_id = str(original.get("segment_id", ""))
+                primary = by_segment.get(primary_id)
+                if primary_id not in visible_ids or not is_valid_primary_evidence(primary):
+                    corrected.append(_fallback_evidence_range(
+                        original, segments, int(getattr(args, "min_context_segments", 5))
+                    ))
+                    continue
             requested_support = proposal.get("supporting_segment_ids", [])
             if not isinstance(requested_support, list):
                 requested_support = []
@@ -536,6 +675,33 @@ def refine_evidence_ranges(
                 requested_support.extend(
                     item.get("segment_id") for item in detailed_support if isinstance(item, dict)
                 )
+            primary_order = document_order.get(primary_id, -1)
+            next_topic_orders = [
+                document_order[segment.id] for segment in segments
+                if segment.id in visible_ids
+                and document_order.get(segment.id, -1) > primary_order
+                and looks_like_topic_switch(segment)
+            ]
+            next_topic_order = min(next_topic_orders, default=len(segments))
+            requested_support = [
+                segment_id for segment_id in requested_support
+                if not (
+                    segment_id in by_segment
+                    and document_order.get(segment_id, -1) >= next_topic_order
+                )
+            ]
+            topic_anchor = _topic_anchor_id(
+                primary_id, visible_ids, segments, str(original.get("code", ""))
+            )
+            if topic_anchor:
+                requested_support.append(topic_anchor)
+            requested_support = _ensure_minimum_context_ids(
+                requested_support,
+                primary_id,
+                visible_ids,
+                segments,
+                max(1, int(getattr(args, "min_context_segments", 5))),
+            )
             supporting_ids, evidence_context = _evidence_text_from_ids(
                 requested_support,
                 primary_id,
@@ -1238,7 +1404,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default="http://127.0.0.1:11434", help="Ollama 位址")
     parser.add_argument("--chunk-chars", type=int, default=5000, help="每次送模型的約略字元上限")
     parser.add_argument("--chunk-segments", type=int, default=10, help="每次送模型的句數上限")
-    parser.add_argument("--context-radius", type=int, default=6, help="每句前後可供模型判斷的上下文句數")
+    parser.add_argument("--context-radius", type=int, default=12, help="每句前後可供模型判斷的上下文句數")
+    parser.add_argument("--min-context-segments", type=int, default=5, help="每筆 code 至少顯示的上下文句數")
     parser.add_argument("--timeout", type=int, default=600, help="每區塊逾時秒數")
     parser.add_argument("--retries", type=int, default=2, help="模型格式錯誤或連線失敗重試次數")
     parser.add_argument("--overwrite", action="store_true", help="覆寫已存在的 CSV；預設跳過")
@@ -1263,6 +1430,9 @@ def main() -> int:
         return 2
     if not 1 <= getattr(args, "context_radius", 6) <= 20:
         print("--context-radius 必須介於 1 到 20", file=sys.stderr)
+        return 2
+    if not 1 <= args.min_context_segments <= 2 * args.context_radius + 1:
+        print("--min-context-segments 必須介於 1 和目前搜尋視窗總句數之間", file=sys.stderr)
         return 2
     if not 0 <= args.min_codes <= 10000:
         print("--min-codes 必須介於 0 到 10000", file=sys.stderr)

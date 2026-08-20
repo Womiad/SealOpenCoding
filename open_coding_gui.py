@@ -23,7 +23,7 @@ SCRIPT = APP_DIR / "open_coding.py"
 ICON = APP_DIR / "seal_open_coding_icon.png"
 READER_ICON = APP_DIR / "seal_code_reader_icon.png"
 APP_NAME = "海豹牌 Open Coding 工具"
-APP_VERSION = "V1.3"
+APP_VERSION = "V1.4"
 FILE_TYPES = [
     ("支援的文檔", "*.txt *.md *.docx"),
     ("文字檔", "*.txt"),
@@ -545,7 +545,8 @@ class OpenCodingGUI(tk.Tk):
         self.host_var = tk.StringVar(value="http://127.0.0.1:11434")
         self.chunk_var = tk.StringVar(value="5000")
         self.chunk_segments_var = tk.StringVar(value="10")
-        self.context_radius_var = tk.StringVar(value="6")
+        self.context_radius_var = tk.StringVar(value="12")
+        self.min_context_segments_var = tk.StringVar(value="5")
         self.min_codes_var = tk.StringVar(value="10")
         self.overwrite_var = tk.BooleanVar(value=False)
         self.focused_var = tk.BooleanVar(value=True)
@@ -653,10 +654,12 @@ class OpenCodingGUI(tk.Tk):
         ttk.Spinbox(settings, from_=0, to=1000, increment=1, textvariable=self.min_codes_var, width=10).grid(row=1, column=1, sticky="w", padx=(5, 14), pady=(7, 0))
         ttk.Label(settings, text="前後文搜尋上限").grid(row=1, column=2, sticky="w", pady=(7, 0))
         ttk.Spinbox(settings, from_=1, to=20, increment=1, textvariable=self.context_radius_var, width=8).grid(row=1, column=3, sticky="w", padx=(5, 14), pady=(7, 0))
-        ttk.Label(settings, text="前後各最多幾句；輸出只顯示自動判定相關的句子", foreground="#555555").grid(row=1, column=4, columnspan=4, sticky="w", pady=(7, 0))
+        ttk.Label(settings, text="保底上下文句數").grid(row=1, column=4, sticky="w", pady=(7, 0))
+        ttk.Spinbox(settings, from_=1, to=41, increment=1, textvariable=self.min_context_segments_var, width=8).grid(row=1, column=5, sticky="w", padx=(5, 14), pady=(7, 0))
+        ttk.Label(settings, text="不足時在同一題內補相鄰發言", foreground="#555555").grid(row=1, column=6, columnspan=2, sticky="w", pady=(7, 0))
         ttk.Label(
             settings,
-            text="V1.3 會在精選後校正每筆 code 的主句與彈性上下文；上限較大可捕捉較長體驗，但會稍慢。",
+            text="V1.4 會加入討論主題錨點，再校正主句與彈性上下文；預設前後各 12 句。",
             foreground="#555555",
         ).grid(row=2, column=0, columnspan=8, sticky="w", pady=(7, 0))
 
@@ -719,7 +722,7 @@ class OpenCodingGUI(tk.Tk):
         if path:
             self.output_var.set(path)
 
-    def _validate(self) -> tuple[list[str], int, int, int, int] | None:
+    def _validate(self) -> tuple[list[str], int, int, int, int, int] | None:
         sources = list(self.sources.get(0, "end"))
         if not sources:
             messagebox.showwarning("尚未選擇", "請至少加入一份訪談文本或一個資料夾。")
@@ -762,13 +765,23 @@ class OpenCodingGUI(tk.Tk):
         except ValueError:
             messagebox.showwarning("上下文設定無效", "前後文搜尋上限必須是 1 到 20 的整數。")
             return None
-        return sources, chunk_chars, chunk_segments, min_codes, context_radius
+        try:
+            min_context_segments = int(self.min_context_segments_var.get())
+            if not 1 <= min_context_segments <= 2 * context_radius + 1:
+                raise ValueError
+        except ValueError:
+            messagebox.showwarning(
+                "保底上下文設定無效",
+                f"保底上下文句數必須是 1 到 {2 * context_radius + 1} 的整數。",
+            )
+            return None
+        return sources, chunk_chars, chunk_segments, min_codes, context_radius, min_context_segments
 
     def _start(self) -> None:
         validated = self._validate()
         if validated is None:
             return
-        sources, chunk_chars, chunk_segments, min_codes, context_radius = validated
+        sources, chunk_chars, chunk_segments, min_codes, context_radius, min_context_segments = validated
         command = [
             sys.executable, "-u", str(SCRIPT), *sources,
             "--guide", self.guide_var.get().strip(),
@@ -778,6 +791,7 @@ class OpenCodingGUI(tk.Tk):
             "--chunk-chars", str(chunk_chars),
             "--chunk-segments", str(chunk_segments),
             "--context-radius", str(context_radius),
+            "--min-context-segments", str(min_context_segments),
             "--min-codes", str(min_codes),
         ]
         if self.overwrite_var.get():
