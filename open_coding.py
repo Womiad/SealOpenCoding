@@ -1403,7 +1403,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default="qwen3:8b", help="Ollama 模型名稱")
     parser.add_argument("--host", default="http://127.0.0.1:11434", help="Ollama 位址")
     parser.add_argument("--chunk-chars", type=int, default=5000, help="每次送模型的約略字元上限")
-    parser.add_argument("--chunk-segments", type=int, default=30, help="每次送模型的句數上限")
+    parser.add_argument("--chunk-segments", type=int, default=15, help="每次送模型的句數上限")
     parser.add_argument("--context-radius", type=int, default=12, help="每句前後可供模型判斷的上下文句數")
     parser.add_argument("--min-context-segments", type=int, default=5, help="每筆 code 至少顯示的上下文句數")
     parser.add_argument("--timeout", type=int, default=600, help="每區塊逾時秒數")

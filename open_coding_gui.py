@@ -544,7 +544,7 @@ class OpenCodingGUI(tk.Tk):
         self.model_var = tk.StringVar(value="qwen3:8b")
         self.host_var = tk.StringVar(value="http://127.0.0.1:11434")
         self.chunk_var = tk.StringVar(value="5000")
-        self.chunk_segments_var = tk.StringVar(value="30")
+        self.chunk_segments_var = tk.StringVar(value="15")
         self.context_radius_var = tk.StringVar(value="12")
         self.min_context_segments_var = tk.StringVar(value="5")
         self.min_codes_var = tk.StringVar(value="10")

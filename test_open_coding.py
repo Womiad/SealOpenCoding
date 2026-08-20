@@ -11,13 +11,13 @@ import open_coding_gui
 
 
 class OpenCodingTests(unittest.TestCase):
-    def test_cli_defaults_use_thirty_sentence_batches(self):
+    def test_cli_defaults_use_fifteen_sentence_batches(self):
         with patch.object(sys, "argv", [
             "open_coding.py", "fixture.txt", "--guide", "guide.txt",
         ]):
             args = open_coding.parse_args()
         self.assertEqual(args.chunk_chars, 5000)
-        self.assertEqual(args.chunk_segments, 30)
+        self.assertEqual(args.chunk_segments, 15)
 
     def test_reader_loads_utf8_bom_csv(self):
         with tempfile.TemporaryDirectory() as directory:
