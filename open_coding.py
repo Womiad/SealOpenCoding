@@ -1037,6 +1037,118 @@ def refine_codings(guide: str, codings: list[dict], args: argparse.Namespace) ->
     return _ensure_minimum(selected, codings, overall_minimum)
 
 
+def _normalise_concept(value: str) -> str:
+    """Normalise a short Chinese/English concept for conservative overlap checks."""
+    return re.sub(r"[^\w\u3400-\u9fff]+", "", value, flags=re.UNICODE).lower()
+
+
+def _validate_research_directions(raw_directions: object, coding_by_id: dict[str, dict]) -> tuple[list[dict], list[str]]:
+    """Keep grounded cross-code directions and explain every rejected item."""
+    if not isinstance(raw_directions, list):
+        return [], ["research_directions 不是陣列"]
+    if not raw_directions:
+        return [], ["模型沒有提出任何研究方向"]
+    directions: list[dict] = []
+    rejection_reasons: list[str] = []
+    seen_directions: set[str] = set()
+    generic_ranking = re.compile(r"分數|評分|高分|最高分|高品質線索|優先複核")
+    require_multiple = len(coding_by_id) >= 2
+    for number, item in enumerate(raw_directions, 1):
+        prefix = f"方向 {number}"
+        if not isinstance(item, dict):
+            rejection_reasons.append(f"{prefix} 不是物件")
+            continue
+        ids = item.get("candidate_ids", [])
+        valid_ids = (
+            list(dict.fromkeys(str(value) for value in ids if str(value) in coding_by_id))
+            if isinstance(ids, list) else []
+        )
+        direction = str(item.get("direction", "")).strip()
+        finding = str(item.get("possible_finding", "")).strip()
+        opportunity = str(item.get("research_opportunity", "")).strip()
+        shared_concept = str(item.get("shared_concept", "")).strip()
+        direction_text = f"{direction} {finding} {opportunity}"
+        concept = _normalise_concept(shared_concept)
+        if not direction or not finding or not opportunity:
+            rejection_reasons.append(f"{prefix} 缺少方向、可能發現或研究機會")
+            continue
+        if generic_ranking.search(direction_text):
+            rejection_reasons.append(f"{prefix} 只是分數／複核描述，不是分析方向")
+            continue
+        if require_multiple and len(valid_ids) < 2:
+            rejection_reasons.append(f"{prefix} 未整合至少兩個有效 code")
+            continue
+        if not valid_ids:
+            rejection_reasons.append(f"{prefix} 沒有有效 candidate_id")
+            continue
+        if len(concept) < 2 or concept not in _normalise_concept(direction_text):
+            rejection_reasons.append(f"{prefix} 的 shared_concept 未出現在方向分析中")
+            continue
+        supported_ids = []
+        for candidate_id in valid_ids:
+            coding = coding_by_id[candidate_id]
+            evidence_text = " ".join(str(coding.get(field, "")) for field in (
+                "code", "evidence_quote", "evidence_context",
+            ))
+            if concept in _normalise_concept(evidence_text):
+                supported_ids.append(candidate_id)
+        if require_multiple and len(supported_ids) < 2:
+            rejection_reasons.append(f"{prefix} 的 shared_concept 未同時連結至少兩個引用 code")
+            continue
+        if not supported_ids:
+            rejection_reasons.append(f"{prefix} 的 shared_concept 找不到引用語證")
+            continue
+        direction_key = _normalise_concept(direction)
+        if direction_key in seen_directions:
+            rejection_reasons.append(f"{prefix} 與前一方向重複")
+            continue
+        seen_directions.add(direction_key)
+        directions.append({
+            "direction": direction,
+            "possible_finding": finding,
+            "research_opportunity": opportunity,
+            "shared_concept": shared_concept,
+            "candidate_ids": supported_ids,
+            "caution": str(item.get("caution", "")).strip(),
+        })
+    return directions[:4], rejection_reasons
+
+
+def _recover_research_directions(
+    guide: str,
+    coding_items: list[dict],
+    coding_by_id: dict[str, dict],
+    args: argparse.Namespace,
+) -> tuple[list[dict], list[str]]:
+    """Retry direction synthesis with a small prompt dedicated to cross-code relations."""
+    compact_items = [{
+        "candidate_id": item["candidate_id"],
+        "code": item.get("code", ""),
+        "why_this_code": item.get("why_this_code", ""),
+        "evidence_quote": item.get("evidence_quote", ""),
+        "evidence_context": str(item.get("evidence_context", ""))[:700],
+    } for item in coding_items]
+    system = """你是質性研究分析助理。前一次研究方向整理沒有通過驗證，現在只做跨 code 的分析整理。
+請提出 2–4 個真正的研究方向。每個方向必須：
+1. 整合至少兩個 candidate，不得只是重述單一 code，也不得提到分數、排名或優先複核。
+2. 指出 codes 之間的共同歷程、條件→行為→後果、矛盾、界線、轉變或正反差異。
+3. possible_finding 寫暫定的質性發現；research_opportunity 寫後續應比較、追問或驗證什麼，不直接宣稱產品功能。
+4. shared_concept 必須是至少兩個引用 code／語證以及本方向文字都逐字包含的同一個關鍵詞，至少兩個字。
+5. candidate_ids 只能使用輸入 ID，且每個方向至少兩個。不要因分析分數選擇材料。
+只輸出 JSON：
+{"research_directions":[{"direction":"分析方向名稱","possible_finding":"跨 code 的暫定發現","research_opportunity":"後續研究機會","shared_concept":"共同關鍵詞","candidate_ids":["C00001","C00002"],"caution":"反例、限制或待確認處"}]}"""
+    prompt = (
+        f"研究指引：\n---\n{guide}\n---\n\n"
+        "已通過原文定位的 codes（順序不代表重要性）：\n"
+        + json.dumps(compact_items, ensure_ascii=False)
+    )
+    try:
+        result = ollama_chat(args.host, args.model, system, prompt, args.timeout)
+        return _validate_research_directions(result.get("research_directions", []), coding_by_id)
+    except (RuntimeError, AttributeError, TypeError, ValueError) as exc:
+        return [], [f"專用恢復整理失敗：{exc}"]
+
+
 def generate_document_synthesis(
     guide: str,
     source: Path,
@@ -1067,20 +1179,15 @@ def generate_document_synthesis(
             "evidence_context": coding.get("evidence_context", ""),
             "code": coding.get("code", ""),
             "why_this_code": coding.get("rationale", ""),
-            "analytic_score": coding.get("analytic_score", 0),
-            "research_relevance": coding.get("research_relevance", 0),
-            "behavior_pattern": coding.get("behavior_pattern", 0),
-            "evidence_strength": coding.get("evidence_strength", 0),
-            "opportunity_potential": coding.get("opportunity_potential", 0),
-            "inference_risk": coding.get("inference_risk", 0),
         })
 
     system = """你是嚴謹的質性研究助理。請替一份訪談建立簡短文本簡介，並根據已通過原文定位的 codes 提出可能研究方向。
 文本簡介只能寫逐字稿明確支持的資料；年齡、身分或背景未明時必須寫「未明」，不得由語氣猜測。特質是訪談中可觀察的偏好、態度或行為傾向，不可做人格或臨床診斷。
 研究方向只是供研究者複核的暫定分析線索，不是研究結論。研究機會必須由受訪者明確需求、阻礙、未滿足目標、矛盾或接受條件導出，不可把一般故事直接變成產品功能。
-每個方向必須引用至少一個輸入中存在的 candidate_id，並提供 shared_concept：它必須是該 code 與方向／可能發現／研究機會中都逐字出現的關鍵概念（至少兩個字），用來防止引用錯配。不得創造 ID。
+每個研究方向必須整合至少兩個 codes，說明共同歷程、條件→行為→後果、張力、界線、轉變或正反差異；不得只是重述單一 code，也不得依分數或排名列出線索。
+每個方向必須引用至少兩個輸入中存在的 candidate_id，並提供 shared_concept：它必須是至少兩個引用 code／語證與方向／可能發現／研究機會中都逐字出現的關鍵概念（至少兩個字），用來防止引用錯配。不得創造 ID。
 只輸出 JSON：
-{"profile":{"participant":"受訪者是誰／角色，未明則寫未明","age":"明確年齡或未明","identity_context":"其他明確身分或生活脈絡，未明則寫未明","characteristics":["有原文根據的特質"],"interview_summary":"本篇訪談內容簡介"},"research_directions":[{"direction":"研究方向名稱","possible_finding":"可能的質性發現","research_opportunity":"可供後續研究或設計追問的機會，不是功能結論","shared_concept":"code 與本方向逐字共有的概念","candidate_ids":["C00001"],"caution":"解讀限制或仍需確認處"}]}"""
+{"profile":{"participant":"受訪者是誰／角色，未明則寫未明","age":"明確年齡或未明","identity_context":"其他明確身分或生活脈絡，未明則寫未明","characteristics":["有原文根據的特質"],"interview_summary":"本篇訪談內容簡介"},"research_directions":[{"direction":"研究方向名稱","possible_finding":"可能的質性發現","research_opportunity":"可供後續研究或設計追問的機會，不是功能結論","shared_concept":"至少兩筆 code 與本方向逐字共有的概念","candidate_ids":["C00001","C00002"],"caution":"解讀限制或仍需確認處"}]}"""
     prompt = (
         f"來源文件：{source.name}\n\n研究指引：\n---\n{guide}\n---\n\n"
         "逐字稿片段（依原始順序；若因長度截斷，不得推論未提供部分）：\n"
@@ -1092,6 +1199,9 @@ def generate_document_synthesis(
         "participant": "未明", "age": "未明", "identity_context": "未明", "characteristics": [],
         "interview_summary": f"{source.name} 的訪談逐字稿；自動簡介產生失敗，請研究者直接複核原文。",
     }
+    profile = fallback_profile
+    directions: list[dict] = []
+    direction_failures: list[str] = []
     try:
         result = ollama_chat(args.host, args.model, system, prompt, args.timeout)
         raw_profile = result.get("profile", {})
@@ -1108,40 +1218,38 @@ def generate_document_synthesis(
             "interview_summary": str(raw_profile.get("interview_summary", "")).strip()
                 or fallback_profile["interview_summary"],
         }
-        directions = []
-        raw_directions = result.get("research_directions", [])
-        if isinstance(raw_directions, list):
-            for item in raw_directions:
-                if not isinstance(item, dict):
-                    continue
-                ids = item.get("candidate_ids", [])
-                valid_ids = ([str(value) for value in ids if str(value) in coding_by_id]
-                             if isinstance(ids, list) else [])
-                direction = str(item.get("direction", "")).strip()
-                finding = str(item.get("possible_finding", "")).strip()
-                opportunity = str(item.get("research_opportunity", "")).strip()
-                shared_concept = str(item.get("shared_concept", "")).strip()
-                concept_chars = re.sub(r"\s", "", shared_concept)
-                direction_text = f"{direction} {finding} {opportunity}"
-                supported_ids = [candidate_id for candidate_id in valid_ids if shared_concept and (
-                    shared_concept in str(coding_by_id[candidate_id].get("code", ""))
-                    or shared_concept in str(coding_by_id[candidate_id].get("evidence_quote", ""))
-                    or shared_concept in str(coding_by_id[candidate_id].get("evidence_context", ""))
-                )]
-                if (direction and finding and opportunity and len(concept_chars) >= 2
-                        and shared_concept in direction_text and supported_ids):
-                    directions.append({
-                        "direction": direction,
-                        "possible_finding": finding,
-                        "research_opportunity": opportunity,
-                        "shared_concept": shared_concept,
-                        "candidate_ids": supported_ids,
-                        "caution": str(item.get("caution", "")).strip(),
-                    })
-        return {"profile": profile, "research_directions": directions, "coding_by_id": coding_by_id}
+        directions, direction_failures = _validate_research_directions(
+            result.get("research_directions", []), coding_by_id,
+        )
     except (RuntimeError, AttributeError, TypeError, ValueError) as exc:
         print(f"    警告：文本簡介／研究方向產生失敗：{exc}", flush=True)
-        return {"profile": fallback_profile, "research_directions": [], "coding_by_id": coding_by_id}
+        direction_failures = [f"首次整理失敗：{exc}"]
+    if not directions and len(coding_items) >= 2:
+        if direction_failures:
+            print(
+                "    警告：首次研究方向未通過驗證：" + "；".join(direction_failures[:3]),
+                flush=True,
+            )
+        print("    研究方向恢復整理：改用跨 code 關係專用提示重試…", flush=True)
+        recovered, recovery_failures = _recover_research_directions(
+            guide, coding_items, coding_by_id, args,
+        )
+        directions = recovered
+        direction_failures.extend(recovery_failures)
+        if directions:
+            print(f"    研究方向恢復整理完成：形成 {len(directions)} 個跨 code 方向。", flush=True)
+        else:
+            print(
+                "    警告：研究方向恢復整理仍未通過：" + "；".join(recovery_failures[:3]),
+                flush=True,
+            )
+    note = "；".join(direction_failures[:5]) if not directions else ""
+    return {
+        "profile": profile,
+        "research_directions": directions,
+        "coding_by_id": coding_by_id,
+        "research_directions_note": note,
+    }
 
 
 def render_research_directions(synthesis: dict) -> str:
@@ -1149,16 +1257,15 @@ def render_research_directions(synthesis: dict) -> str:
     directions = synthesis.get("research_directions", [])
     coding_by_id = synthesis.get("coding_by_id", {})
     if not directions:
-        ranked = sorted(coding_by_id.items(), key=lambda item: int(item[1].get("analytic_score", 0)), reverse=True)[:3]
-        if not ranked:
+        if not coding_by_id:
             return "本篇沒有足夠且可可靠定位的 code 可形成研究方向；請研究者回到逐字稿檢查。"
-        directions = [{
-            "direction": "優先複核高分析分數的線索",
-            "possible_finding": "以下是評分較高的初步 coding，可作為後續跨文本比較的起點。",
-            "candidate_ids": [candidate_id for candidate_id, _coding in ranked],
-            "research_opportunity": "比較這些高品質線索在其他受訪者中是否重複、相反或具有不同條件。",
-            "caution": "這是模型篩選失敗時的分數回退，不代表研究結論。",
-        }]
+        note = synthesis.get("research_directions_note", "")
+        detail = f"\n整理記錄：{note}" if note else ""
+        return (
+            "本篇已有可閱讀的初步 codes，但自動研究方向整理未成功。\n"
+            "海豹沒有用最高分 codes 冒充研究方向；請研究者先閱讀 coding 頁，或重新執行本篇。"
+            + detail
+        )
     blocks = []
     for number, direction in enumerate(directions, 1):
         lines = [

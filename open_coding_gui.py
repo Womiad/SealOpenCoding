@@ -23,7 +23,7 @@ SCRIPT = APP_DIR / "open_coding.py"
 ICON = APP_DIR / "seal_open_coding_icon.png"
 READER_ICON = APP_DIR / "seal_code_reader_icon.png"
 APP_NAME = "海豹牌 Open Coding 工具"
-APP_VERSION = "V1.5"
+APP_VERSION = "V1.6"
 FILE_TYPES = [
     ("支援的文檔", "*.txt *.md *.docx"),
     ("文字檔", "*.txt"),
@@ -685,7 +685,7 @@ class OpenCodingGUI(tk.Tk):
         ttk.Label(settings, text="不足時在同一題內補相鄰發言", foreground="#555555").grid(row=1, column=6, columnspan=2, sticky="w", pady=(7, 0))
         ttk.Label(
             settings,
-            text="V1.5 候選過少會自動拆批重掃；上下文保留主題錨點且預設至少 5 句。",
+            text="V1.6 會跨 code 整理研究方向；候選過少仍會自動拆批重掃。",
             foreground="#555555",
         ).grid(row=2, column=0, columnspan=8, sticky="w", pady=(7, 0))
 

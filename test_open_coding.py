@@ -42,6 +42,72 @@ class OpenCodingTests(unittest.TestCase):
         self.assertIn("較早的討論", full)
         self.assertIn("後續追問", full)
 
+    def test_research_direction_recovery_groups_multiple_codes(self):
+        segments = open_coding.segment_transcript(
+            "參與者：遇到任務壓力時會先暫停操作。\n參與者：壓力大時原本只想休息一下，最後卻放棄任務。"
+        )
+        codings = [
+            {
+                "segment_id": segments[0].id, "evidence_quote": segments[0].text,
+                "evidence_context": segments[0].text,
+                "code": "任務壓力觸發暫停操作作為因應", "rationale": "直接描述觸發條件。",
+            },
+            {
+                "segment_id": segments[1].id, "evidence_quote": segments[1].text,
+                "evidence_context": segments[1].text,
+                "code": "任務壓力下從短暫休息走向放棄", "rationale": "描述行為發展與結果。",
+            },
+        ]
+        first_result = {
+            "profile": {"participant": "參與者", "age": "未明", "identity_context": "未明",
+                        "characteristics": [], "interview_summary": "合成摘要。"},
+            "research_directions": [],
+        }
+        recovery_result = {"research_directions": [{
+            "direction": "任務壓力下的中斷歷程",
+            "possible_finding": "任務壓力不只觸發暫停，也可能讓短暫休息逐步走向放棄。",
+            "research_opportunity": "比較不同任務壓力如何改變中斷歷程與可介入時點。",
+            "shared_concept": "壓力", "candidate_ids": ["C00001", "C00002"],
+            "caution": "仍需比較非壓力情境。",
+        }]}
+        args = Namespace(host="local", model="test", timeout=10)
+        with patch.object(open_coding, "ollama_chat", side_effect=[first_result, recovery_result]) as chat:
+            synthesis = open_coding.generate_document_synthesis(
+                "研究任務壓力與中斷行為", Path("fixture.txt"), segments, codings, args,
+            )
+        self.assertEqual(chat.call_count, 2)
+        self.assertEqual(len(synthesis["research_directions"]), 1)
+        self.assertEqual(
+            synthesis["research_directions"][0]["candidate_ids"],
+            ["C00001", "C00002"],
+        )
+
+    def test_research_direction_rejects_single_code_restatement(self):
+        coding_by_id = {
+            "C00001": {"code": "任務壓力觸發暫停", "evidence_quote": "任務壓力大就先暫停"},
+            "C00002": {"code": "任務壓力下放棄", "evidence_quote": "任務壓力大就會放棄"},
+        }
+        directions, reasons = open_coding._validate_research_directions([{
+            "direction": "任務壓力與中斷", "possible_finding": "任務壓力可能觸發暫停。",
+            "research_opportunity": "追問任務壓力來源。", "shared_concept": "任務壓力",
+            "candidate_ids": ["C00001"],
+        }], coding_by_id)
+        self.assertEqual(directions, [])
+        self.assertTrue(any("至少兩個" in reason for reason in reasons))
+
+    def test_research_direction_failure_does_not_rank_top_codes(self):
+        text = open_coding.render_research_directions({
+            "research_directions": [],
+            "research_directions_note": "合成驗證未通過",
+            "coding_by_id": {
+                "C00001": {"code": "高分 code 甲", "analytic_score": 99},
+                "C00002": {"code": "高分 code 乙", "analytic_score": 98},
+            },
+        })
+        self.assertIn("沒有用最高分 codes 冒充研究方向", text)
+        self.assertNotIn("高分 code 甲", text)
+        self.assertNotIn("優先複核高分析分數", text)
+
     def test_segmentation_preserves_location_speaker_and_context(self):
         segments = open_coding.segment_transcript("提問者：測試問題。\n參與者：測試陳述甲。測試陳述乙！")
         self.assertEqual([item.text for item in segments], ["測試問題。", "測試陳述甲。", "測試陳述乙！"])
