@@ -12,12 +12,6 @@ CSV 欄位包括：來源檔、句子 ID、原始行號、說話者、原句全�
 
 目前預設使用這台電腦已安裝的 `qwen3:8b`。若另有更大的中文指令模型，可用 `--model` 切換；模型品質會直接影響 coding 品質。
 
-## 隱私與 Git 防呆
-
-`.gitignore` 預設排除逐字稿／訪談資料夾、常見 `Sxx`／`Txx` 參與者檔名、私有 codebook 與 research guide、`*_open_coding.csv`、試算表、錄音錄影、文件、壓縮檔、憑證、輸出資料夾及打包產物。公開的通用 `CODEBOOK_GUIDE_V*.md` 會明確保留。這些規則用來降低不小心執行 `git add .` 時提交研究資料的風險。
-
-`.gitignore` 只保護尚未追蹤的新檔案，無法移除已經被 Git 追蹤或存在於歷史 commit 的內容；也不能取代人工確認。每次提交前仍應執行 `git status` 與 `git diff --cached`，不要對被忽略的研究資料使用 `git add -f`。若敏感資料曾經提交，必須另外清理 Git 歷史並輪替已外洩的憑證。
-
 ## 使用方式
 
 ### GUI（建議）
