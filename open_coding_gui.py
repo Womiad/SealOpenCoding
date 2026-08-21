@@ -23,7 +23,9 @@ SCRIPT = APP_DIR / "open_coding.py"
 ICON = APP_DIR / "seal_open_coding_icon.png"
 READER_ICON = APP_DIR / "seal_code_reader_icon.png"
 APP_NAME = "海豹牌 Open Coding 工具"
-APP_VERSION = "V1.6"
+APP_VERSION = "V1.7"
+READER_DEFAULT_GEOMETRY = "940x600"
+READER_MINIMUM_SIZE = (680, 440)
 FILE_TYPES = [
     ("支援的文檔", "*.txt *.md *.docx"),
     ("文字檔", "*.txt"),
@@ -250,8 +252,8 @@ class CodingResultReader(tk.Toplevel):
         super().__init__(parent)
         self.parent = parent
         self.title(f"Seal Code Reader {APP_VERSION}（內建）")
-        self.geometry("940x840")
-        self.minsize(760, 680)
+        self.geometry(READER_DEFAULT_GEOMETRY)
+        self.minsize(*READER_MINIMUM_SIZE)
         self.reader_icon: tk.PhotoImage | None = None
         self.header_icon: tk.PhotoImage | None = None
         if READER_ICON.is_file():
@@ -283,8 +285,7 @@ class CodingResultReader(tk.Toplevel):
         outer = ttk.Frame(self, padding=16)
         outer.pack(fill="both", expand=True)
         outer.columnconfigure(0, weight=1)
-        for row, weight in ((4, 4), (5, 2), (7, 2), (9, 3)):
-            outer.rowconfigure(row, weight=weight)
+        outer.rowconfigure(4, weight=1)
 
         title_bar = ttk.Frame(outer)
         title_bar.grid(row=0, column=0, sticky="ew")
@@ -320,28 +321,40 @@ class CodingResultReader(tk.Toplevel):
         ).pack(side="left")
 
         ttk.Label(outer, textvariable=self.meta_var, foreground="#555555").grid(row=3, column=0, sticky="w", pady=(0, 5))
-        self.context_box = ttk.LabelFrame(outer, text="與本 code 相關的原文範圍", padding=8)
-        self.context_box.grid(row=4, column=0, sticky="nsew")
+        content = ttk.Panedwindow(outer, orient="horizontal")
+        content.grid(row=4, column=0, sticky="nsew")
+        left = ttk.Frame(content, padding=(0, 0, 6, 0))
+        right = ttk.Frame(content, padding=(6, 0, 0, 0))
+        content.add(left, weight=3)
+        content.add(right, weight=2)
+        left.columnconfigure(0, weight=1)
+        left.rowconfigure(0, weight=1)
+        right.columnconfigure(0, weight=1)
+        for row, weight in ((0, 2), (2, 2), (4, 3)):
+            right.rowconfigure(row, weight=weight)
+
+        self.context_box = ttk.LabelFrame(left, text="與本 code 相關的原文範圍", padding=8)
+        self.context_box.grid(row=0, column=0, sticky="nsew")
         self.context_box.columnconfigure(0, weight=1)
         self.context_box.rowconfigure(0, weight=1)
-        self.context_text = self._readonly_text(self.context_box, height=10, font=("Microsoft JhengHei UI", 11))
+        self.context_text = self._readonly_text(self.context_box, height=12, font=("Microsoft JhengHei UI", 11))
 
-        self.original_box = ttk.LabelFrame(outer, text="實際 Coding 片段", padding=8)
-        self.original_box.grid(row=5, column=0, sticky="nsew", pady=(8, 0))
+        self.original_box = ttk.LabelFrame(right, text="實際 Coding 片段", padding=8)
+        self.original_box.grid(row=0, column=0, sticky="nsew")
         self.original_box.columnconfigure(0, weight=1)
         self.original_box.rowconfigure(0, weight=1)
-        self.original_text = self._readonly_text(self.original_box, height=5, font=("Microsoft JhengHei UI", 11))
+        self.original_text = self._readonly_text(self.original_box, height=4, font=("Microsoft JhengHei UI", 11))
 
-        self.code_heading = ttk.Label(outer, text="Code（情境／前因 → 想法或行為 → 結果／意義）", font=("Microsoft JhengHei UI", 10, "bold"))
-        self.code_heading.grid(row=6, column=0, sticky="w", pady=(10, 3))
-        self.code_text = self._readonly_text(outer, height=4, font=("Microsoft JhengHei UI", 12, "bold"), row=7)
+        self.code_heading = ttk.Label(right, text="Code（情境／前因 → 想法或行為 → 結果／意義）", font=("Microsoft JhengHei UI", 10, "bold"))
+        self.code_heading.grid(row=1, column=0, sticky="w", pady=(7, 3))
+        self.code_text = self._readonly_text(right, height=3, font=("Microsoft JhengHei UI", 12, "bold"), row=2)
 
-        self.why_heading = ttk.Label(outer, text="Why this code", font=("Microsoft JhengHei UI", 10, "bold"))
-        self.why_heading.grid(row=8, column=0, sticky="w", pady=(10, 3))
-        self.why_text = self._readonly_text(outer, height=5, font=("Microsoft JhengHei UI", 11), row=9)
+        self.why_heading = ttk.Label(right, text="Why this code", font=("Microsoft JhengHei UI", 10, "bold"))
+        self.why_heading.grid(row=3, column=0, sticky="w", pady=(7, 3))
+        self.why_text = self._readonly_text(right, height=4, font=("Microsoft JhengHei UI", 11), row=4)
 
         nav = ttk.Frame(outer)
-        nav.grid(row=10, column=0, sticky="ew", pady=(12, 0))
+        nav.grid(row=5, column=0, sticky="ew", pady=(10, 0))
         nav.columnconfigure(2, weight=1)
         self.previous_button = ttk.Button(nav, text="← 上一頁", command=self._previous)
         self.previous_button.grid(row=0, column=0)
@@ -685,7 +698,7 @@ class OpenCodingGUI(tk.Tk):
         ttk.Label(settings, text="不足時在同一題內補相鄰發言", foreground="#555555").grid(row=1, column=6, columnspan=2, sticky="w", pady=(7, 0))
         ttk.Label(
             settings,
-            text="V1.6 會跨 code 整理研究方向；候選過少仍會自動拆批重掃。",
+            text="V1.7 會補抓基本資訊、重檢同脈絡 code，並依訪談順序呈現；候選過少仍會自動拆批重掃。",
             foreground="#555555",
         ).grid(row=2, column=0, columnspan=8, sticky="w", pady=(7, 0))
 

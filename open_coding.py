@@ -836,6 +836,7 @@ def _focused_select(
     maximum: int,
     stage: str,
     minimum: int = 0,
+    reference_selected: list[dict] | None = None,
 ) -> list[dict] | None:
     """Run one evidence-grounded focused-selection request."""
     candidates = []
@@ -878,6 +879,7 @@ def _focused_select(
 而非缺少情境、行動與關係的短標籤。
 只有 full_context 明確支持因果時才能寫「因為／所以」；沒有明確因果時，用「在……情境下，講者……，呈現……」描述關係，不得補造因果。
 若多筆共同呈現一個模式，可給它們相同或相互呼應的 refined_code；只保留最有力的 1–3 筆證據。
+最低數量只是避免線索過少，不是目標數量；若仍有彼此不重複、可支持不同條件、行為、結果、矛盾或研究機會的高價值 code，應繼續保留到上限，不要一達最低數量就停止。
 每筆 selection 必須包含 evidence_quote：從該 candidate 的 evidence 原封不動複製一段連續文字，不能改寫或跨筆拼接。
 重新核對每個保留項目的五個 0–4 rubric 分數；分數定義與候選中的 quality_rubric 相同，不得因 code 較長或含因果連接詞就提高。
 不得創造 candidate_id。只輸出 JSON：
@@ -892,6 +894,16 @@ def _focused_select(
         f"---\n{guide}\n---\n\n"
         f"這是{stage}，共有 {len(candidates)} 個候選。"
         + quantity_instruction
+        + (
+            "以下 codes 已確定保留；補充時不可選擇只是重複它們的候選：\n"
+            + json.dumps([{
+                "segment_id": row.get("segment_id", ""),
+                "code": row.get("code", ""),
+                "evidence": _shorten(str(row.get("evidence_quote", "")), 140),
+            } for row in reference_selected], ensure_ascii=False)
+            + "\n"
+            if reference_selected else ""
+        )
         + "候選資料：\n"
         + json.dumps(candidates, ensure_ascii=False)
     )
@@ -965,7 +977,31 @@ def _focused_select_resilient(
 ) -> list[dict]:
     selected = _focused_select(guide, codings, args, maximum, stage, minimum)
     if selected is not None:
-        return _ensure_minimum(selected, codings, minimum)[:maximum]
+        result = _ensure_minimum(selected, codings, minimum)[:maximum]
+        rescue_threshold = max(minimum, round(maximum * 0.75)) if minimum else 0
+        if minimum and len(result) <= rescue_threshold and len(result) < maximum:
+            selected_keys = {
+                (row.get("segment_id"), row.get("evidence_quote")) for row in result
+            }
+            omitted = [
+                row for row in codings
+                if quality_eligible(row)
+                and (row.get("segment_id"), row.get("evidence_quote")) not in selected_keys
+            ]
+            if omitted:
+                capacity = maximum - len(result)
+                print(
+                    f"    {stage}只保留 {len(result)} 個，海豹再檢查是否有不重複的高價值線索…",
+                    flush=True,
+                )
+                extras = _focused_select(
+                    guide, omitted, args, capacity, f"{stage}補充檢查", 0,
+                    reference_selected=list(result),
+                )
+                if extras:
+                    result.extend(extras[:capacity])
+                    print(f"    {stage}補充 {min(len(extras), capacity)} 個不同線索。", flush=True)
+        return result[:maximum]
     eligible = [row for row in codings if quality_eligible(row)]
     fallback_count = min(len(eligible), max(minimum, maximum))
     fallback = sorted(eligible, key=lambda row: int(row.get("analytic_score", 0)), reverse=True)[:fallback_count]
@@ -1002,7 +1038,9 @@ def refine_codings(guide: str, codings: list[dict], args: argparse.Namespace) ->
     if len(codings) <= 1:
         return codings
     overall_minimum = min(len(codings), max(0, int(getattr(args, "min_codes", 10))))
-    natural_maximum = max(8, min(40, round(len(codings) * 0.35)))
+    # V1.7 gives focused refinement room to retain several distinct, valuable
+    # patterns. The user minimum remains a floor, never a target or hard count.
+    natural_maximum = max(12, min(50, round(len(codings) * 0.50)))
     overall_maximum = min(len(codings), max(natural_maximum, overall_minimum))
     if len(codings) <= 24:
         selected = _focused_select_resilient(
@@ -1014,7 +1052,7 @@ def refine_codings(guide: str, codings: list[dict], args: argparse.Namespace) ->
     batches = [codings[index:index + 20] for index in range(0, len(codings), 20)]
     per_batch_floor = (overall_minimum + len(batches) - 1) // len(batches)
     for index, batch in enumerate(batches, 1):
-        batch_maximum = min(len(batch), max(3, min(8, round(len(batch) * 0.40)), per_batch_floor))
+        batch_maximum = min(len(batch), max(4, min(10, round(len(batch) * 0.50)), per_batch_floor))
         print(f"    初選 {index}/{len(batches)}：{len(batch)} 個候選", flush=True)
         shortlist.extend(_focused_select_resilient(
             guide, batch, args, batch_maximum, f"初選 {index}"
@@ -1058,45 +1096,56 @@ def _validate_research_directions(raw_directions: object, coding_by_id: dict[str
         if not isinstance(item, dict):
             rejection_reasons.append(f"{prefix} 不是物件")
             continue
-        ids = item.get("candidate_ids", [])
-        valid_ids = (
-            list(dict.fromkeys(str(value) for value in ids if str(value) in coding_by_id))
-            if isinstance(ids, list) else []
-        )
         direction = str(item.get("direction", "")).strip()
         finding = str(item.get("possible_finding", "")).strip()
         opportunity = str(item.get("research_opportunity", "")).strip()
         shared_concept = str(item.get("shared_concept", "")).strip()
         direction_text = f"{direction} {finding} {opportunity}"
-        concept = _normalise_concept(shared_concept)
         if not direction or not finding or not opportunity:
             rejection_reasons.append(f"{prefix} 缺少方向、可能發現或研究機會")
             continue
         if generic_ranking.search(direction_text):
             rejection_reasons.append(f"{prefix} 只是分數／複核描述，不是分析方向")
             continue
-        if require_multiple and len(valid_ids) < 2:
-            rejection_reasons.append(f"{prefix} 未整合至少兩個有效 code")
+        raw_links = item.get("evidence_links", [])
+        if not isinstance(raw_links, list):
+            rejection_reasons.append(f"{prefix} 的 evidence_links 不是陣列")
             continue
-        if not valid_ids:
-            rejection_reasons.append(f"{prefix} 沒有有效 candidate_id")
-            continue
-        if len(concept) < 2 or concept not in _normalise_concept(direction_text):
-            rejection_reasons.append(f"{prefix} 的 shared_concept 未出現在方向分析中")
-            continue
-        supported_ids = []
-        for candidate_id in valid_ids:
-            coding = coding_by_id[candidate_id]
-            evidence_text = " ".join(str(coding.get(field, "")) for field in (
+        evidence_links: list[dict[str, str]] = []
+        linked_ids: set[str] = set()
+        invalid_links = 0
+        for link in raw_links:
+            if not isinstance(link, dict):
+                invalid_links += 1
+                continue
+            candidate_id = str(link.get("candidate_id", "")).strip()
+            connection = str(link.get("connection", "")).strip()
+            anchor_quote = str(link.get("anchor_quote", "")).strip()
+            coding = coding_by_id.get(candidate_id)
+            if coding is None or candidate_id in linked_ids or not connection or generic_ranking.search(connection):
+                invalid_links += 1
+                continue
+            source_text = " ".join(str(coding.get(field, "")) for field in (
                 "code", "evidence_quote", "evidence_context",
             ))
-            if concept in _normalise_concept(evidence_text):
-                supported_ids.append(candidate_id)
-        if require_multiple and len(supported_ids) < 2:
-            rejection_reasons.append(f"{prefix} 的 shared_concept 未同時連結至少兩個引用 code")
+            anchor = _normalise_concept(anchor_quote)
+            if len(anchor) < 2 or anchor not in _normalise_concept(source_text):
+                invalid_links += 1
+                continue
+            linked_ids.add(candidate_id)
+            evidence_links.append({
+                "candidate_id": candidate_id,
+                "connection": connection,
+                "anchor_quote": anchor_quote,
+            })
+        if require_multiple and len(evidence_links) < 2:
+            rejection_reasons.append(
+                f"{prefix} 只有 {len(evidence_links)} 個通過逐筆語證驗證的 code 連結"
+                + (f"（另有 {invalid_links} 筆無效）" if invalid_links else "")
+            )
             continue
-        if not supported_ids:
-            rejection_reasons.append(f"{prefix} 的 shared_concept 找不到引用語證")
+        if not evidence_links:
+            rejection_reasons.append(f"{prefix} 沒有通過逐筆語證驗證的 code 連結")
             continue
         direction_key = _normalise_concept(direction)
         if direction_key in seen_directions:
@@ -1108,7 +1157,8 @@ def _validate_research_directions(raw_directions: object, coding_by_id: dict[str
             "possible_finding": finding,
             "research_opportunity": opportunity,
             "shared_concept": shared_concept,
-            "candidate_ids": supported_ids,
+            "candidate_ids": [link["candidate_id"] for link in evidence_links],
+            "evidence_links": evidence_links,
             "caution": str(item.get("caution", "")).strip(),
         })
     return directions[:4], rejection_reasons
@@ -1133,10 +1183,11 @@ def _recover_research_directions(
 1. 整合至少兩個 candidate，不得只是重述單一 code，也不得提到分數、排名或優先複核。
 2. 指出 codes 之間的共同歷程、條件→行為→後果、矛盾、界線、轉變或正反差異。
 3. possible_finding 寫暫定的質性發現；research_opportunity 寫後續應比較、追問或驗證什麼，不直接宣稱產品功能。
-4. shared_concept 必須是至少兩個引用 code／語證以及本方向文字都逐字包含的同一個關鍵詞，至少兩個字。
-5. candidate_ids 只能使用輸入 ID，且每個方向至少兩個。不要因分析分數選擇材料。
+4. 不要求不同 code 使用完全相同的詞。請用 evidence_links 逐筆說明每個 code 如何支持這個跨-code關係。
+5. 每個 evidence_link 必須包含輸入中的 candidate_id、connection，以及從該 candidate 的 code／evidence_quote／evidence_context 原封不動複製的短 anchor_quote。每個方向至少兩筆、candidate_id 不可重複。
+6. shared_concept 只作為方向的簡短概念標籤，不負責逐字驗證。不要因分析分數選擇材料。
 只輸出 JSON：
-{"research_directions":[{"direction":"分析方向名稱","possible_finding":"跨 code 的暫定發現","research_opportunity":"後續研究機會","shared_concept":"共同關鍵詞","candidate_ids":["C00001","C00002"],"caution":"反例、限制或待確認處"}]}"""
+{"research_directions":[{"direction":"分析方向名稱","possible_finding":"跨 code 的暫定發現","research_opportunity":"後續研究機會","shared_concept":"方向概念標籤","evidence_links":[{"candidate_id":"C00001","connection":"這筆 code 如何支持方向中的條件、行為、結果或差異","anchor_quote":"從該 candidate 原封不動複製的短語"},{"candidate_id":"C00002","connection":"另一筆 code 如何與前者形成共同模式、歷程或對比","anchor_quote":"另一段原文短語"}],"caution":"反例、限制或待確認處"}]}"""
     prompt = (
         f"研究指引：\n---\n{guide}\n---\n\n"
         "已通過原文定位的 codes（順序不代表重要性）：\n"
@@ -1149,6 +1200,95 @@ def _recover_research_directions(
         return [], [f"專用恢復整理失敗：{exc}"]
 
 
+def generate_document_profile(
+    guide: str,
+    source: Path,
+    segments: list[Segment],
+    codings: list[dict],
+    args: argparse.Namespace,
+) -> dict:
+    """Extract opening demographics separately so direction failures cannot erase them."""
+    opening_items = []
+    opening_chars = 0
+    for segment in segments[:140]:
+        size = len(segment.text) + len(segment.speaker) + 30
+        if opening_items and opening_chars + size > 12000:
+            break
+        opening_items.append({
+            "segment_id": segment.id,
+            "speaker": segment.speaker or "未標記講者",
+            "text": segment.text,
+        })
+        opening_chars += size
+    opening_by_id = {item["segment_id"]: item for item in opening_items}
+    coding_overview = [{
+        "code": coding.get("code", ""),
+        "why_this_code": _shorten(str(coding.get("rationale", "")), 160),
+    } for coding in codings[:50]]
+    system = """你是嚴謹的質性訪談資料整理員，只負責文本首頁與基本資訊，不做研究方向。
+訪談開頭通常會詢問年齡、研究角色、工作、家庭／關係、居住、照顧或治療等基本背景。請優先辨識參與者對這些問題的明確回答，不要因後面主題較突出而忽略開頭。
+規則：
+1. participant、age、每個 identity_fact 與 characteristic 都必須附 segment_id 和從該段原封不動複製的 evidence_quote；沒有直接語證就填「未明」或省略，不得由語氣、疾病、檔名或刻板印象猜測。
+2. 訪員的問題可以幫助理解，但 evidence_quote 應優先引用參與者自己的回答。年齡只接受明確數字或明確年齡描述。
+3. identity_facts 一項只寫一個明確事實，例如工作、家庭關係、生活安排或研究相關身分；不要混入分析判斷。
+4. characteristics 只能寫訪談中可觀察且與研究相關的偏好、態度或行為傾向，不做人格式或臨床診斷。
+5. interview_summary 可參考 coding overview 概述整篇內容，但不能補造基本資料。
+只輸出 JSON：
+{"participant":{"value":"角色或未明","segment_id":"S000001","evidence_quote":"逐字短語"},"age":{"value":"明確年齡或未明","segment_id":"S000002","evidence_quote":"逐字短語"},"identity_facts":[{"fact":"一項基本背景","segment_id":"S000003","evidence_quote":"逐字短語"}],"characteristics":[{"trait":"一項可觀察傾向","segment_id":"S000004","evidence_quote":"逐字短語"}],"interview_summary":"整篇訪談的簡短內容導讀"}"""
+    configured_role = str(getattr(args, "participant_role", "") or "").strip()
+    prompt = (
+        f"來源文件：{source.name}\n"
+        f"研究指引：\n---\n{guide}\n---\n"
+        + (f"\n研究指引與檔名規則已確認本篇主要角色：{configured_role}\n" if configured_role else "")
+        + "\n訪談開頭（依原始順序）：\n"
+        + json.dumps(opening_items, ensure_ascii=False)
+        + "\n\n整篇 coding overview（只供摘要，不可用來猜基本資料）：\n"
+        + json.dumps(coding_overview, ensure_ascii=False)
+    )
+    fallback = {
+        "participant": configured_role or "未明",
+        "age": "未明",
+        "identity_context": "未明",
+        "characteristics": [],
+        "interview_summary": f"{source.name} 的訪談逐字稿；自動簡介產生失敗，請研究者直接複核原文。",
+    }
+
+    def grounded(entry: object, value_field: str) -> str:
+        if not isinstance(entry, dict):
+            return ""
+        value = str(entry.get(value_field, "")).strip()
+        segment_id = str(entry.get("segment_id", "")).strip()
+        quote = str(entry.get("evidence_quote", "")).strip()
+        segment = opening_by_id.get(segment_id)
+        if not value or not quote or segment is None or quote not in segment["text"]:
+            return ""
+        return value
+
+    try:
+        result = ollama_chat(args.host, args.model, system, prompt, args.timeout)
+    except (RuntimeError, AttributeError, TypeError, ValueError) as exc:
+        print(f"    警告：文本基本資訊整理失敗：{exc}", flush=True)
+        return fallback
+    participant = configured_role or grounded(result.get("participant", {}), "value") or "未明"
+    age = grounded(result.get("age", {}), "value") or "未明"
+    identity_facts = []
+    raw_facts = result.get("identity_facts", [])
+    if isinstance(raw_facts, list):
+        identity_facts = [value for item in raw_facts if (value := grounded(item, "fact"))]
+    characteristics = []
+    raw_traits = result.get("characteristics", [])
+    if isinstance(raw_traits, list):
+        characteristics = [value for item in raw_traits if (value := grounded(item, "trait"))]
+    summary = str(result.get("interview_summary", "")).strip() or fallback["interview_summary"]
+    return {
+        "participant": participant,
+        "age": age,
+        "identity_context": "；".join(dict.fromkeys(identity_facts)) or "未明",
+        "characteristics": list(dict.fromkeys(characteristics)),
+        "interview_summary": summary,
+    }
+
+
 def generate_document_synthesis(
     guide: str,
     source: Path,
@@ -1157,16 +1297,6 @@ def generate_document_synthesis(
     args: argparse.Namespace,
 ) -> dict:
     """Create a grounded reader cover page and tentative research directions."""
-    transcript_items = []
-    transcript_chars = 0
-    for segment in segments:
-        item = {"segment_id": segment.id, "speaker": segment.speaker or "未標記講者", "text": segment.text}
-        size = len(segment.text) + len(segment.speaker) + 30
-        if transcript_items and transcript_chars + size > 12000:
-            break
-        transcript_items.append(item)
-        transcript_chars += size
-
     coding_items = []
     coding_by_id: dict[str, dict] = {}
     for index, coding in enumerate(codings, 1):
@@ -1181,43 +1311,22 @@ def generate_document_synthesis(
             "why_this_code": coding.get("rationale", ""),
         })
 
-    system = """你是嚴謹的質性研究助理。請替一份訪談建立簡短文本簡介，並根據已通過原文定位的 codes 提出可能研究方向。
-文本簡介只能寫逐字稿明確支持的資料；年齡、身分或背景未明時必須寫「未明」，不得由語氣猜測。特質是訪談中可觀察的偏好、態度或行為傾向，不可做人格或臨床診斷。
+    profile = generate_document_profile(guide, source, segments, codings, args)
+    system = """你是嚴謹的質性研究助理。請根據已通過原文定位的 codes 提出可能研究方向。
 研究方向只是供研究者複核的暫定分析線索，不是研究結論。研究機會必須由受訪者明確需求、阻礙、未滿足目標、矛盾或接受條件導出，不可把一般故事直接變成產品功能。
 每個研究方向必須整合至少兩個 codes，說明共同歷程、條件→行為→後果、張力、界線、轉變或正反差異；不得只是重述單一 code，也不得依分數或排名列出線索。
-每個方向必須引用至少兩個輸入中存在的 candidate_id，並提供 shared_concept：它必須是至少兩個引用 code／語證與方向／可能發現／研究機會中都逐字出現的關鍵概念（至少兩個字），用來防止引用錯配。不得創造 ID。
+每個方向必須提供至少兩個 evidence_links。每筆 link 都要有輸入中存在且不重複的 candidate_id、說明該 code 如何支持方向的 connection，以及從該 candidate 的 code／evidence_quote／evidence_context 原封不動複製的短 anchor_quote。程式會逐筆定位 anchor_quote；不再要求不同 codes 使用完全相同的詞。shared_concept 只是方向概念標籤。不得創造 ID。
 只輸出 JSON：
-{"profile":{"participant":"受訪者是誰／角色，未明則寫未明","age":"明確年齡或未明","identity_context":"其他明確身分或生活脈絡，未明則寫未明","characteristics":["有原文根據的特質"],"interview_summary":"本篇訪談內容簡介"},"research_directions":[{"direction":"研究方向名稱","possible_finding":"可能的質性發現","research_opportunity":"可供後續研究或設計追問的機會，不是功能結論","shared_concept":"至少兩筆 code 與本方向逐字共有的概念","candidate_ids":["C00001","C00002"],"caution":"解讀限制或仍需確認處"}]}"""
+{"research_directions":[{"direction":"研究方向名稱","possible_finding":"可能的質性發現","research_opportunity":"可供後續研究或設計追問的機會，不是功能結論","shared_concept":"方向概念標籤","evidence_links":[{"candidate_id":"C00001","connection":"此 code 如何支持方向","anchor_quote":"該 candidate 中的逐字短語"},{"candidate_id":"C00002","connection":"此 code 如何與前者形成關係","anchor_quote":"該 candidate 中的另一段逐字短語"}],"caution":"解讀限制或仍需確認處"}]}"""
     prompt = (
         f"來源文件：{source.name}\n\n研究指引：\n---\n{guide}\n---\n\n"
-        "逐字稿片段（依原始順序；若因長度截斷，不得推論未提供部分）：\n"
-        + json.dumps(transcript_items, ensure_ascii=False)
-        + "\n\n已通過定位與精選的 coding candidates：\n"
+        "已通過定位與精選的 coding candidates（順序是訪談順序，不是分數排名）：\n"
         + json.dumps(coding_items, ensure_ascii=False)
     )
-    fallback_profile = {
-        "participant": "未明", "age": "未明", "identity_context": "未明", "characteristics": [],
-        "interview_summary": f"{source.name} 的訪談逐字稿；自動簡介產生失敗，請研究者直接複核原文。",
-    }
-    profile = fallback_profile
     directions: list[dict] = []
     direction_failures: list[str] = []
     try:
         result = ollama_chat(args.host, args.model, system, prompt, args.timeout)
-        raw_profile = result.get("profile", {})
-        if not isinstance(raw_profile, dict):
-            raw_profile = {}
-        raw_characteristics = raw_profile.get("characteristics", [])
-        characteristics = ([str(item).strip() for item in raw_characteristics if str(item).strip()]
-                           if isinstance(raw_characteristics, list) else [])
-        profile = {
-            "participant": str(raw_profile.get("participant", "未明")).strip() or "未明",
-            "age": str(raw_profile.get("age", "未明")).strip() or "未明",
-            "identity_context": str(raw_profile.get("identity_context", "未明")).strip() or "未明",
-            "characteristics": characteristics,
-            "interview_summary": str(raw_profile.get("interview_summary", "")).strip()
-                or fallback_profile["interview_summary"],
-        }
         directions, direction_failures = _validate_research_directions(
             result.get("research_directions", []), coding_by_id,
         )
@@ -1276,6 +1385,10 @@ def render_research_directions(synthesis: dict) -> str:
         for candidate_id in direction["candidate_ids"]:
             coding = coding_by_id.get(candidate_id)
             if coding:
+                link = next((item for item in direction.get("evidence_links", [])
+                             if item.get("candidate_id") == candidate_id), {})
+                if link.get("connection"):
+                    lines.append(f"連結理由：{link['connection']}")
                 lines.extend([
                     f"相關 code：{coding.get('code', '')}",
                     f"語證：{coding.get('evidence_context') or coding.get('evidence_quote', '')}",
@@ -1302,6 +1415,216 @@ def _merge_unique_codings(*groups: list[dict]) -> list[dict]:
             seen.add(key)
             merged.append(row)
     return merged
+
+
+def sort_codings_in_transcript_order(codings: list[dict], segments: list[Segment]) -> list[dict]:
+    """Return coding rows in source order; scores never control reading order."""
+    order = {segment.id: index for index, segment in enumerate(segments)}
+    return sorted(
+        codings,
+        key=lambda row: order.get(str(row.get("segment_id", "")), len(order)),
+    )
+
+
+def _coding_support_ids(coding: dict) -> set[str]:
+    raw = coding.get("supporting_segment_ids", [])
+    if isinstance(raw, str):
+        values = raw.split("|")
+    elif isinstance(raw, list):
+        values = raw
+    else:
+        values = []
+    result = {str(value) for value in values if str(value)}
+    if coding.get("segment_id"):
+        result.add(str(coding["segment_id"]))
+    return result
+
+
+def _code_bigram_similarity(left: str, right: str) -> float:
+    def bigrams(value: str) -> set[str]:
+        clean = _normalise_concept(value)
+        return {clean[index:index + 2] for index in range(max(0, len(clean) - 1))}
+    left_parts = bigrams(left)
+    right_parts = bigrams(right)
+    if not left_parts or not right_parts:
+        return 0.0
+    return len(left_parts & right_parts) / len(left_parts | right_parts)
+
+
+def _codes_have_opposing_claims(left: str, right: str) -> bool:
+    oppositions = (
+        ("接受", "拒絕"), ("信任", "不信任"), ("願意", "不願意"),
+        ("需要", "不需要"), ("有用", "沒用"), ("支持", "反對"),
+        ("主動", "被動"), ("能控制", "無法控制"),
+    )
+    for positive, negative in oppositions:
+        left_positive = positive in left and negative not in left
+        right_positive = positive in right and negative not in right
+        left_negative = negative in left
+        right_negative = negative in right
+        if (left_positive and right_negative) or (right_positive and left_negative):
+            return True
+    return False
+
+
+def context_consistency_groups(codings: list[dict], maximum_group_size: int = 6) -> list[list[dict]]:
+    """Find small overlapping-context groups that may duplicate or contradict."""
+    parent = list(range(len(codings)))
+
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    def union(left: int, right: int) -> None:
+        left_root, right_root = find(left), find(right)
+        if left_root != right_root:
+            parent[right_root] = left_root
+
+    for left_index, left in enumerate(codings):
+        left_ids = _coding_support_ids(left)
+        for right_index in range(left_index + 1, len(codings)):
+            right = codings[right_index]
+            if not left_ids.intersection(_coding_support_ids(right)):
+                continue
+            similarity = _code_bigram_similarity(str(left.get("code", "")), str(right.get("code", "")))
+            contradiction = _codes_have_opposing_claims(
+                str(left.get("code", "")), str(right.get("code", "")),
+            )
+            if similarity >= 0.22 or contradiction:
+                union(left_index, right_index)
+
+    components: dict[int, list[dict]] = {}
+    for index, coding in enumerate(codings):
+        components.setdefault(find(index), []).append(coding)
+    groups = []
+    for component in components.values():
+        if len(component) < 2:
+            continue
+        for start in range(0, len(component), maximum_group_size):
+            group = component[start:start + maximum_group_size]
+            if len(group) >= 2:
+                groups.append(group)
+    return groups
+
+
+def _consolidate_context_group(
+    guide: str,
+    group: list[dict],
+    segments: list[Segment],
+    args: argparse.Namespace,
+) -> list[dict] | None:
+    """Merge duplicates or recode contradictions while preserving exact evidence."""
+    by_id = {f"C{index:05d}": coding for index, coding in enumerate(group, 1)}
+    candidates = [{
+        "candidate_id": candidate_id,
+        "segment_id": coding.get("segment_id", ""),
+        "code": coding.get("code", ""),
+        "why_this_code": coding.get("rationale", ""),
+        "evidence_quote": coding.get("evidence_quote", ""),
+        "evidence_context": _shorten(str(coding.get("evidence_context", "")), 900),
+    } for candidate_id, coding in by_id.items()]
+    system = """你是質性研究 coding 的最後一致性檢查員。輸入 codes 位於同一或重疊的原文脈絡，且可能語意重複或互相矛盾。
+逐筆回到語證判斷：
+1. 真正描述同一情境、行為與意義的重複 codes 才 merge；只是共享主題但條件、行動或結果不同者必須分開。
+2. 若看似矛盾，先檢查是否發生於不同條件、時間或角色。用 recode 分別寫清楚界線；原文真的呈現矛盾時也保留兩面，不可任意選一邊。
+3. 每個輸入 candidate_id 必須在所有 results 的 source_candidate_ids 中剛好出現一次。不得刪除、重複或創造 ID。
+4. keep 必須只有一個來源且沿用原 code；merge 可有多個來源；recode 可一個或多個，但不可把不同語意硬合併。
+5. 每個來源都要有 evidence_anchor，從該 candidate 的 code、evidence_quote 或 evidence_context 原封不動複製短語，供程式定位。
+6. 新 code 與 rationale 只能描述所有引用語證共同支持的關係，不得由分數決定。
+只輸出 JSON：
+{"results":[{"action":"keep|merge|recode","source_candidate_ids":["C00001"],"code":"完整且有條件界線的 code","rationale":"語證如何支持此 code，以及為何合併或重新區分","evidence_anchors":[{"candidate_id":"C00001","anchor_quote":"逐字短語"}]}]}"""
+    prompt = (
+        f"研究指引：\n---\n{guide}\n---\n\n"
+        "待檢查的同脈絡 codes：\n" + json.dumps(candidates, ensure_ascii=False)
+    )
+    try:
+        response = ollama_chat(args.host, args.model, system, prompt, args.timeout)
+    except (RuntimeError, AttributeError, TypeError, ValueError) as exc:
+        print(f"    警告：同脈絡 code 一致性檢查失敗，保留原 codes：{exc}", flush=True)
+        return None
+    results = response.get("results", [])
+    if not isinstance(results, list):
+        return None
+    seen: set[str] = set()
+    consolidated: list[dict] = []
+    segment_order = {segment.id: index for index, segment in enumerate(segments)}
+    for result in results:
+        if not isinstance(result, dict):
+            return None
+        action = str(result.get("action", "")).strip().lower()
+        source_ids = result.get("source_candidate_ids", [])
+        if not isinstance(source_ids, list):
+            return None
+        source_ids = list(dict.fromkeys(str(value) for value in source_ids))
+        if not source_ids or any(value not in by_id or value in seen for value in source_ids):
+            return None
+        if action == "keep" and len(source_ids) != 1:
+            return None
+        if action not in {"keep", "merge", "recode"}:
+            return None
+        anchors = result.get("evidence_anchors", [])
+        anchor_by_id = {
+            str(item.get("candidate_id", "")): str(item.get("anchor_quote", "")).strip()
+            for item in anchors if isinstance(item, dict)
+        } if isinstance(anchors, list) else {}
+        for candidate_id in source_ids:
+            coding = by_id[candidate_id]
+            source_text = " ".join(str(coding.get(field, "")) for field in (
+                "code", "evidence_quote", "evidence_context",
+            ))
+            anchor = _normalise_concept(anchor_by_id.get(candidate_id, ""))
+            if len(anchor) < 2 or anchor not in _normalise_concept(source_text):
+                return None
+        source_rows = [by_id[value] for value in source_ids]
+        source_rows.sort(key=lambda row: segment_order.get(str(row.get("segment_id", "")), len(segment_order)))
+        row = dict(source_rows[0])
+        if action != "keep":
+            code = str(result.get("code", "")).strip()
+            rationale = str(result.get("rationale", "")).strip()
+            if not code or not rationale:
+                return None
+            row["code"] = code
+            row["rationale"] = rationale
+        support_ids = set().union(*(_coding_support_ids(item) for item in source_rows))
+        row["supporting_segment_ids"] = sorted(
+            support_ids, key=lambda value: segment_order.get(value, len(segment_order)),
+        )
+        contexts = list(dict.fromkeys(
+            str(item.get("evidence_context", "")).strip()
+            for item in source_rows if str(item.get("evidence_context", "")).strip()
+        ))
+        row["evidence_context"] = "\n\n".join(contexts)
+        consolidated.append(row)
+        seen.update(source_ids)
+    if seen != set(by_id):
+        return None
+    return consolidated
+
+
+def consolidate_context_codings(
+    guide: str,
+    codings: list[dict],
+    segments: list[Segment],
+    args: argparse.Namespace,
+) -> list[dict]:
+    groups = context_consistency_groups(codings)
+    if not groups:
+        return codings
+    replacements: dict[int, tuple[list[dict], list[dict]]] = {}
+    for index, group in enumerate(groups, 1):
+        print(f"  最後一致性檢查 {index}/{len(groups)}：{len(group)} 個同脈絡 codes", flush=True)
+        replacement = _consolidate_context_group(guide, group, segments, args)
+        if replacement is not None:
+            replacements[id(group[0])] = (group, replacement)
+    if not replacements:
+        return codings
+    member_ids = {id(row) for group, _replacement in replacements.values() for row in group}
+    result = [row for row in codings if id(row) not in member_ids]
+    for _group, replacement in replacements.values():
+        result.extend(replacement)
+    return sort_codings_in_transcript_order(result, segments)
 
 
 def analyze_chunk(
@@ -1445,7 +1768,9 @@ def code_file(
 
     if all_codings:
         all_codings = refine_evidence_ranges(guide, all_codings, segments, args)
-        print("  語證範圍校正完成：已依每筆 code 重選必要上下文。", flush=True)
+        all_codings = consolidate_context_codings(guide, all_codings, segments, args)
+        all_codings = sort_codings_in_transcript_order(all_codings, segments)
+        print("  語證與一致性檢查完成：已校正上下文、合併重複並依訪談順序排列。", flush=True)
 
     count_explanation = code_count_explanation(
         minimum=max(0, int(getattr(args, "min_codes", 10))),

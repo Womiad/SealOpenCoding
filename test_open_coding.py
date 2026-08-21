@@ -11,6 +11,12 @@ import open_coding_gui
 
 
 class OpenCodingTests(unittest.TestCase):
+    def test_built_in_reader_uses_compact_horizontal_window(self):
+        width, height = map(int, open_coding_gui.READER_DEFAULT_GEOMETRY.split("x"))
+        self.assertLessEqual(height, 600)
+        self.assertLessEqual(open_coding_gui.READER_MINIMUM_SIZE[1], 440)
+        self.assertGreater(width, height)
+
     def test_cli_defaults_use_fifteen_sentence_batches(self):
         with patch.object(sys, "argv", [
             "open_coding.py", "fixture.txt", "--guide", "guide.txt",
@@ -58,29 +64,72 @@ class OpenCodingTests(unittest.TestCase):
                 "code": "任務壓力下從短暫休息走向放棄", "rationale": "描述行為發展與結果。",
             },
         ]
-        first_result = {
-            "profile": {"participant": "參與者", "age": "未明", "identity_context": "未明",
-                        "characteristics": [], "interview_summary": "合成摘要。"},
-            "research_directions": [],
+        profile_result = {
+            "participant": {"value": "參與者", "segment_id": "S000001",
+                            "evidence_quote": "遇到任務壓力"},
+            "age": {"value": "未明", "segment_id": "", "evidence_quote": ""},
+            "identity_facts": [{"fact": "正在執行任務", "segment_id": "S000001",
+                                "evidence_quote": "任務壓力"}],
+            "characteristics": [{"trait": "遇到壓力會先暫停", "segment_id": "S000001",
+                                 "evidence_quote": "會先暫停操作"}],
+            "interview_summary": "合成摘要。",
         }
+        first_result = {"research_directions": []}
         recovery_result = {"research_directions": [{
             "direction": "任務壓力下的中斷歷程",
             "possible_finding": "任務壓力不只觸發暫停，也可能讓短暫休息逐步走向放棄。",
             "research_opportunity": "比較不同任務壓力如何改變中斷歷程與可介入時點。",
-            "shared_concept": "壓力", "candidate_ids": ["C00001", "C00002"],
+            "shared_concept": "任務中斷歷程",
+            "evidence_links": [
+                {"candidate_id": "C00001", "connection": "呈現壓力先觸發暫停操作。",
+                 "anchor_quote": "任務壓力觸發暫停操作"},
+                {"candidate_id": "C00002", "connection": "呈現暫停之後可能走向放棄。",
+                 "anchor_quote": "從短暫休息走向放棄"},
+            ],
             "caution": "仍需比較非壓力情境。",
         }]}
         args = Namespace(host="local", model="test", timeout=10)
-        with patch.object(open_coding, "ollama_chat", side_effect=[first_result, recovery_result]) as chat:
+        with patch.object(
+            open_coding, "ollama_chat",
+            side_effect=[profile_result, first_result, recovery_result],
+        ) as chat:
             synthesis = open_coding.generate_document_synthesis(
                 "研究任務壓力與中斷行為", Path("fixture.txt"), segments, codings, args,
             )
-        self.assertEqual(chat.call_count, 2)
+        self.assertEqual(chat.call_count, 3)
+        self.assertEqual(synthesis["profile"]["participant"], "參與者")
+        self.assertEqual(synthesis["profile"]["identity_context"], "正在執行任務")
         self.assertEqual(len(synthesis["research_directions"]), 1)
         self.assertEqual(
             synthesis["research_directions"][0]["candidate_ids"],
             ["C00001", "C00002"],
         )
+
+    def test_opening_profile_extracts_only_grounded_basic_information(self):
+        segments = open_coding.segment_transcript(
+            "訪員：請問你今年幾歲？\n參與者：我今年四十二歲，在合成單位工作。"
+        )
+        result = {
+            "participant": {"value": "受訪者", "segment_id": "S000002",
+                            "evidence_quote": "我今年四十二歲"},
+            "age": {"value": "42 歲", "segment_id": "S000002",
+                    "evidence_quote": "四十二歲"},
+            "identity_facts": [
+                {"fact": "在合成單位工作", "segment_id": "S000002",
+                 "evidence_quote": "在合成單位工作"},
+                {"fact": "不存在的家庭資訊", "segment_id": "S000002",
+                 "evidence_quote": "沒有出現在原文"},
+            ],
+            "characteristics": [], "interview_summary": "開頭詢問基本資訊。",
+        }
+        args = Namespace(host="local", model="test", timeout=10, participant_role="")
+        with patch.object(open_coding, "ollama_chat", return_value=result):
+            profile = open_coding.generate_document_profile(
+                "合成研究規則", Path("fixture.txt"), segments, [], args,
+            )
+        self.assertEqual(profile["age"], "42 歲")
+        self.assertEqual(profile["identity_context"], "在合成單位工作")
+        self.assertNotIn("家庭", profile["identity_context"])
 
     def test_research_direction_rejects_single_code_restatement(self):
         coding_by_id = {
@@ -89,11 +138,116 @@ class OpenCodingTests(unittest.TestCase):
         }
         directions, reasons = open_coding._validate_research_directions([{
             "direction": "任務壓力與中斷", "possible_finding": "任務壓力可能觸發暫停。",
-            "research_opportunity": "追問任務壓力來源。", "shared_concept": "任務壓力",
-            "candidate_ids": ["C00001"],
+            "research_opportunity": "追問任務壓力來源。", "shared_concept": "中斷歷程",
+            "evidence_links": [{
+                "candidate_id": "C00001", "connection": "呈現暫停條件。",
+                "anchor_quote": "任務壓力觸發暫停",
+            }],
         }], coding_by_id)
         self.assertEqual(directions, [])
-        self.assertTrue(any("至少兩個" in reason for reason in reasons))
+        self.assertTrue(any("只有 1 個" in reason for reason in reasons))
+
+    def test_research_direction_accepts_different_grounded_anchors(self):
+        coding_by_id = {
+            "C00001": {"code": "阻礙出現時暫停操作", "evidence_quote": "我會先停一下"},
+            "C00002": {"code": "反覆受阻後放棄任務", "evidence_quote": "後來就不做了"},
+        }
+        directions, reasons = open_coding._validate_research_directions([{
+            "direction": "從暫停到放棄的中斷歷程",
+            "possible_finding": "參與者可能由短暫暫停逐步走向放棄任務。",
+            "research_opportunity": "比較哪些阻礙只造成暫停，哪些會累積成放棄。",
+            "shared_concept": "中斷歷程",
+            "evidence_links": [
+                {"candidate_id": "C00001", "connection": "提供歷程前段的暫停反應。",
+                 "anchor_quote": "暫停操作"},
+                {"candidate_id": "C00002", "connection": "提供歷程後段的放棄結果。",
+                 "anchor_quote": "放棄任務"},
+            ],
+        }], coding_by_id)
+        self.assertEqual(reasons, [])
+        self.assertEqual(directions[0]["candidate_ids"], ["C00001", "C00002"])
+
+    def test_focused_refinement_ceiling_keeps_room_beyond_minimum(self):
+        codings = [{
+            "segment_id": f"S{index:06d}", "evidence_quote": f"合成證據內容 {index}",
+            "code": f"合成 code {index}", "research_relevance": 4,
+            "behavior_pattern": 3, "evidence_strength": 4,
+            "opportunity_potential": 2, "inference_risk": 1,
+        } for index in range(1, 25)]
+        args = Namespace(min_codes=10)
+        with patch.object(open_coding, "_focused_select_resilient", return_value=codings[:12]) as select:
+            selected = open_coding.refine_codings("合成研究規則", codings, args)
+        self.assertEqual(select.call_args.args[3], 12)
+        self.assertEqual(len(selected), 12)
+
+    def test_focused_selection_rechecks_when_result_sticks_to_minimum(self):
+        codings = [{
+            "segment_id": f"S{index:06d}", "evidence_quote": f"合成證據內容 {index}",
+            "code": f"合成 code {index}", "research_relevance": 4,
+            "behavior_pattern": 3, "evidence_strength": 4,
+            "opportunity_potential": 2, "inference_risk": 1,
+        } for index in range(1, 21)]
+        with patch.object(
+            open_coding, "_focused_select",
+            side_effect=[codings[:10], codings[10:12]],
+        ) as select:
+            result = open_coding._focused_select_resilient(
+                "合成研究規則", codings, Namespace(), 15, "最終聚焦精選", 10,
+            )
+        self.assertEqual(select.call_count, 2)
+        self.assertEqual(len(result), 12)
+        self.assertEqual(select.call_args.kwargs["reference_selected"], codings[:10])
+
+    def test_codings_are_read_in_transcript_order_not_score_order(self):
+        segments = open_coding.segment_transcript("角色：第一句。\n角色：第二句。\n角色：第三句。")
+        codings = [
+            {"segment_id": "S000003", "analytic_score": 99},
+            {"segment_id": "S000001", "analytic_score": 55},
+            {"segment_id": "S000002", "analytic_score": 88},
+        ]
+        ordered = open_coding.sort_codings_in_transcript_order(codings, segments)
+        self.assertEqual([row["segment_id"] for row in ordered], ["S000001", "S000002", "S000003"])
+
+    def test_same_context_similar_codes_can_merge_with_grounded_anchors(self):
+        segments = open_coding.segment_transcript("角色：先暫停操作。\n角色：後來仍然放棄任務。")
+        codings = [
+            {
+                "segment_id": "S000001", "supporting_segment_ids": ["S000001", "S000002"],
+                "evidence_quote": "先暫停操作", "evidence_context": "先暫停操作。\n後來仍然放棄任務。",
+                "code": "遇到阻礙時先暫停操作", "rationale": "描述暫停反應。",
+            },
+            {
+                "segment_id": "S000002", "supporting_segment_ids": ["S000001", "S000002"],
+                "evidence_quote": "放棄任務", "evidence_context": "先暫停操作。\n後來仍然放棄任務。",
+                "code": "遇到阻礙時由暫停走向放棄任務", "rationale": "描述後續結果。",
+            },
+        ]
+        response = {"results": [{
+            "action": "merge", "source_candidate_ids": ["C00001", "C00002"],
+            "code": "遇到阻礙時先暫停操作，之後仍可能放棄任務。",
+            "rationale": "兩筆語證描述同一段由暫停走向放棄的歷程。",
+            "evidence_anchors": [
+                {"candidate_id": "C00001", "anchor_quote": "暫停操作"},
+                {"candidate_id": "C00002", "anchor_quote": "放棄任務"},
+            ],
+        }]}
+        args = Namespace(host="local", model="test", timeout=10)
+        with patch.object(open_coding, "ollama_chat", return_value=response):
+            merged = open_coding.consolidate_context_codings(
+                "合成研究規則", codings, segments, args,
+            )
+        self.assertEqual(len(merged), 1)
+        self.assertIn("暫停操作", merged[0]["code"])
+        self.assertEqual(merged[0]["supporting_segment_ids"], ["S000001", "S000002"])
+
+    def test_same_context_opposing_codes_trigger_consistency_group(self):
+        codings = [
+            {"segment_id": "S000001", "supporting_segment_ids": ["S000001"], "code": "願意接受協助"},
+            {"segment_id": "S000001", "supporting_segment_ids": ["S000001"], "code": "不願意接受協助"},
+        ]
+        groups = open_coding.context_consistency_groups(codings)
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(len(groups[0]), 2)
 
     def test_research_direction_failure_does_not_rank_top_codes(self):
         text = open_coding.render_research_directions({
@@ -395,16 +549,22 @@ class OpenCodingTests(unittest.TestCase):
                 "code": "在合成情境下，參與者提供可定位陳述。", "rationale": "來源直接支持。",
                 "confidence": 0.9,
             }]}
-            synthesis_result = {
-                "profile": {"participant": "參與者", "age": "未明", "identity_context": "未明",
-                            "characteristics": [], "interview_summary": "合成測試摘要。"},
-                "research_directions": [],
+            profile_result = {
+                "participant": {"value": "參與者", "segment_id": "S000001",
+                                "evidence_quote": "合成來源句"},
+                "age": {"value": "未明", "segment_id": "", "evidence_quote": ""},
+                "identity_facts": [], "characteristics": [],
+                "interview_summary": "合成測試摘要。",
             }
+            directions_result = {"research_directions": []}
             context_result = {"contexts": [{
                 "candidate_id": "C00001", "primary_segment_id": "S000001",
                 "supporting_segment_ids": ["S000001"], "reason": "單句已完整。",
             }]}
-            with patch.object(open_coding, "ollama_chat", side_effect=[coding_result, context_result, synthesis_result]):
+            with patch.object(
+                open_coding, "ollama_chat",
+                side_effect=[coding_result, context_result, profile_result, directions_result],
+            ):
                 output, count = open_coding.code_file(source, "合成研究規則", args)
             self.assertEqual(count, 1)
             with output.open(encoding="utf-8-sig", newline="") as handle:
