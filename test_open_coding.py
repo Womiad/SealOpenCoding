@@ -481,7 +481,7 @@ class OpenCodingTests(unittest.TestCase):
         segments = open_coding.segment_transcript("參與者：合成片段甲。\n參與者：合成片段乙包含有效動作。")
         args = Namespace(host="local", model="test", timeout=1, retries=0, min_codes=0)
 
-        def fake_chat(_host, _model, _system, prompt, _timeout):
+        def fake_chat(_host, _model, _system, prompt, _timeout, **_options):
             if prompt.count('"coding_allowed"') > 1 or '"segment_id": "S000001"' in prompt:
                 raise RuntimeError("模型請求逾時（1 秒）")
             return {"codings": [{
@@ -509,7 +509,7 @@ class OpenCodingTests(unittest.TestCase):
                 "rationale": "合成來源直接支持。", "confidence": 0.9,
             }]}
 
-        def fake_chat(_host, _model, _system, prompt, _timeout):
+        def fake_chat(_host, _model, _system, prompt, _timeout, **_options):
             calls.append(prompt)
             visible_ids = [
                 item.id for item in segments
@@ -599,3 +599,110 @@ class OpenCodingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SealHardeningTests(unittest.TestCase):
+    """Cover the failure modes that produced an empty CSV reported as success."""
+
+    def test_remote_host_is_refused_by_default(self):
+        for host in ("http://192.168.1.50:11434", "https://ollama.example.com", "10.0.0.4:11434"):
+            with self.subTest(host=host):
+                with self.assertRaises(RuntimeError) as caught:
+                    open_coding.assert_local_host(host)
+                self.assertIn("僅允許本機", str(caught.exception))
+
+    def test_loopback_hosts_are_accepted(self):
+        for host in ("http://127.0.0.1:11434", "http://localhost:11434", "http://[::1]:11434"):
+            with self.subTest(host=host):
+                open_coding.assert_local_host(host)
+
+    def test_request_declares_a_context_window(self):
+        captured = {}
+
+        class _Response:
+            def read(self):
+                return b'{"message": {"content": "{\\"codings\\": []}"}}'
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+        def fake_open(request, timeout=None):
+            captured["payload"] = __import__("json").loads(request.data.decode("utf-8"))
+            return _Response()
+
+        with patch.object(open_coding._OPENER, "open", fake_open):
+            open_coding.ollama_chat("http://127.0.0.1:11434", "m", "s", "p", 10)
+        # Ollama's 4096 default silently truncates the segment list, so every
+        # downstream "cannot be located" retry would be chasing a phantom.
+        self.assertEqual(captured["payload"]["options"]["num_ctx"], 8192)
+
+    def test_top_level_array_is_reported_not_raised_as_attribute_error(self):
+        class _Response:
+            def read(self):
+                return b'{"message": {"content": "[{\\"code\\": \\"x\\"}]"}}'
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+        with patch.object(open_coding._OPENER, "open", lambda *a, **k: _Response()):
+            with self.assertRaises(RuntimeError):
+                open_coding.ollama_chat("http://127.0.0.1:11434", "m", "s", "p", 10)
+
+    def test_speaker_label_on_its_own_line_keeps_the_turn(self):
+        segments = open_coding.segment_transcript(
+            "受訪者：\n我覺得這個功能很麻煩，因為每次都要重新登入。"
+        )
+        self.assertEqual(len(segments), 1)
+        self.assertEqual(segments[0].speaker, "受訪者")
+        self.assertIn("很麻煩", segments[0].text)
+
+    def test_unpunctuated_transcript_is_split_into_usable_segments(self):
+        blob = "受訪者：" + "我覺得這個功能真的很不方便" * 200
+        segments = open_coding.segment_transcript(blob)
+        self.assertGreater(len(segments), 1)
+        self.assertTrue(all(len(s.text) <= open_coding.MAX_SEGMENT_CHARS for s in segments))
+
+    def test_quote_matching_tolerates_punctuation_width_and_spacing(self):
+        segments = open_coding.segment_transcript(
+            "受訪者：我覺得很麻煩,因為每次都要重新輸入(密碼)。"
+        )
+        rows = open_coding.validate_codings(
+            {"codings": [{
+                "segment_id": segments[0].id,
+                "evidence_quote": "我覺得很麻煩，因為每次都要重新輸入（密碼）",
+                "code": "重複輸入密碼造成使用負擔並降低使用意願",
+                "rationale": "受訪者說明原因。",
+            }]},
+            segments,
+        )
+        self.assertEqual(len(rows), 1)
+        # The row keeps the source typography, not the model's.
+        self.assertIn("(密碼)", rows[0]["evidence_quote"])
+
+    def test_first_person_complaint_is_not_treated_as_an_interviewer_turn(self):
+        segment = open_coding.Segment("S000001", 1, "", "他們說這個系統會提供提醒，可是我沒收到。")
+        self.assertFalse(open_coding.looks_like_interviewer_turn(segment))
+
+    def test_interviewer_question_is_still_recognised(self):
+        segment = open_coding.Segment("S000001", 1, "", "那你覺得這個功能好用嗎？")
+        self.assertTrue(open_coding.looks_like_interviewer_turn(segment))
+
+    def test_simplified_chinese_file_is_not_read_as_big5_mojibake(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "gbk.txt"
+            path.write_bytes("受访者：我觉得这个功能很麻烦。".encode("gb18030"))
+            self.assertIn("很麻烦", open_coding.read_document(path))
+
+    def test_evidence_strength_default_does_not_reward_long_sentences(self):
+        short = open_coding.Segment("S000001", 1, "受訪者", "我不會用。")
+        long = open_coding.Segment("S000002", 2, "受訪者", "我不會用，因為每次操作都要重新設定一遍。")
+        self.assertEqual(
+            open_coding.quality_dimensions({}, short)["analytic_score"],
+            open_coding.quality_dimensions({}, long)["analytic_score"],
+        )

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import csv
 import ctypes
+import json
 import os
 import queue
 import re
@@ -13,9 +14,41 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.request
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
+
+EXAMPLE_GUIDE = """# 研究目的
+本研究想了解 [研究對象，例如：短影音創作者] 在 [情境，例如：為影片挑選配樂與音效] 時，
+如何做出取捨、遇到哪些阻礙，以及這些選擇對他們的作品與工作流程造成什麼影響。
+不處理 [排除範圍，例如：商業授權金額、平台演算法猜測]。
+
+# 角色與資料規則
+訪談逐字稿以「訪員：」與「受訪者：」標示。只有受訪者自己的實質經驗、想法、
+行為或評價可以成為 code 的主要依據；訪員的提問與說明只能作為理解情境的上下文。
+受訪者轉述他人說法時，要與其本人的直接經驗區分開來。
+
+# 優先尋找的行為模式
+- 情境／觸發 → 行動／策略 → 結果或意義（例如：遇到某種情況時會怎麼做、為什麼、後來如何）
+- 反覆出現的做法、有條件的選擇（「除非…才會…」）、前後矛盾、態度轉變、自己劃出的界線
+
+# 可形成研究機會的訊號
+- 想做到卻做不到的事、被工具或流程擋住的地方
+- 願意接受或明確拒絕某種做法的條件
+- 自己動手與交給工具之間的分界
+
+# 排除規則
+- 訪員的提問、功能介紹、重述與總結
+- 「嗯」「對」「好」這類沒有內容的簡短回應
+- 沒有理由也沒有具體經驗的一般背景敘述
+- 需要大幅推測受訪者動機才成立的詮釋
+
+# Code 結構
+每個 code 是一個能獨立閱讀的分析句，包含情境、受訪者的行動或理由，以及結果或意義；
+不要只寫主題標籤（例如不要寫「配樂」，要寫「為了避免版權爭議而改用平台內建音樂，
+代價是影片聽起來與別人雷同」）。
+"""
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -23,7 +56,7 @@ SCRIPT = APP_DIR / "open_coding.py"
 ICON = APP_DIR / "seal_open_coding_icon.png"
 READER_ICON = APP_DIR / "seal_code_reader_icon.png"
 APP_NAME = "海豹牌 Open Coding 工具"
-APP_VERSION = "V1.7"
+APP_VERSION = "V1.7.1"
 READER_DEFAULT_GEOMETRY = "940x600"
 READER_MINIMUM_SIZE = (680, 440)
 FILE_TYPES = [
@@ -670,6 +703,14 @@ class OpenCodingGUI(tk.Tk):
         guide_box.columnconfigure(0, weight=1)
         ttk.Entry(guide_box, textvariable=self.guide_var).grid(row=0, column=0, sticky="ew")
         ttk.Button(guide_box, text="選擇…", command=self._choose_guide).grid(row=0, column=1, padx=(8, 0))
+        ttk.Button(guide_box, text="建立範例…", command=self._create_example_guide).grid(row=0, column=2, padx=(8, 0))
+        ttk.Label(
+            guide_box,
+            text="研究指引是 sensitizing framework：說明研究問題與關注方向，不是封閉 codebook。沒有的話按「建立範例」。",
+            foreground="#555555",
+            wraplength=760,
+            justify="left",
+        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
         output_box = ttk.LabelFrame(outer, text="3. CSV 輸出資料夾", padding=8)
         output_box.grid(row=4, column=0, sticky="ew", pady=(10, 0))
@@ -698,7 +739,7 @@ class OpenCodingGUI(tk.Tk):
         ttk.Label(settings, text="不足時在同一題內補相鄰發言", foreground="#555555").grid(row=1, column=6, columnspan=2, sticky="w", pady=(7, 0))
         ttk.Label(
             settings,
-            text="V1.7 會補抓基本資訊、重檢同脈絡 code，並依訪談順序呈現；候選過少仍會自動拆批重掃。",
+            text="開始前會先確認 Ollama 與模型是否就緒；逐字稿只會送到本機位址。候選過少仍會自動拆批重掃。",
             foreground="#555555",
         ).grid(row=2, column=0, columnspan=8, sticky="w", pady=(7, 0))
 
@@ -711,6 +752,7 @@ class OpenCodingGUI(tk.Tk):
         self.cancel_button.grid(row=0, column=1, sticky="w", padx=8)
         self.read_button = ttk.Button(action, text="閱讀結果", command=self._read_results)
         self.read_button.grid(row=0, column=2, sticky="w")
+        ttk.Button(action, text="開啟輸出資料夾", command=self._open_output_folder).grid(row=0, column=5, sticky="e", padx=(8, 0))
         ttk.Checkbutton(action, text="精選重要 code（建議）", variable=self.focused_var).grid(row=0, column=3, sticky="w", padx=(12, 8))
         ttk.Checkbutton(action, text="覆寫已存在的 CSV", variable=self.overwrite_var).grid(row=0, column=4, sticky="e")
 
@@ -755,6 +797,37 @@ class OpenCodingGUI(tk.Tk):
         path = filedialog.askopenfilename(title="選擇研究指引", filetypes=FILE_TYPES)
         if path:
             self.guide_var.set(path)
+
+    def _create_example_guide(self) -> None:
+        """Write a fillable guide and open it, so the first run needs no blank page."""
+        folder = Path(self.output_var.get().strip() or (APP_DIR / "coding_output"))
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            messagebox.showerror("無法建立資料夾", str(exc))
+            return
+        target = folder / "example_research_guide.txt"
+        index = 2
+        while target.exists():
+            target = folder / f"example_research_guide_{index}.txt"
+            index += 1
+        try:
+            target.write_text(EXAMPLE_GUIDE, encoding="utf-8")
+        except OSError as exc:
+            messagebox.showerror("無法寫入範例", str(exc))
+            return
+        self.guide_var.set(str(target))
+        self._append_log(f"已建立範例研究指引：{target}\n")
+        self._append_log("🦭 海豹寫了一份草稿，請把裡面的方括號換成你自己的研究問題。\n", seal=True)
+        try:
+            if hasattr(os, "startfile"):
+                os.startfile(str(target))  # noqa: S606 - opening the user's own file
+        except OSError:
+            pass
+        messagebox.showinfo(
+            "已建立範例研究指引",
+            f"{target}\n\n已幫你填進上面的欄位。請先把方括號 [ ] 的部分換成你的研究問題再開始。",
+        )
 
     def _choose_output(self) -> None:
         path = filedialog.askdirectory(title="選擇 CSV 輸出資料夾")
@@ -816,9 +889,46 @@ class OpenCodingGUI(tk.Tk):
             return None
         return sources, chunk_chars, chunk_segments, min_codes, context_radius, min_context_segments
 
+    def _preflight(self) -> bool:
+        """Check Ollama before spending an hour discovering it was never there.
+
+        Without this, a mistyped model name returns HTTP 404 for every chunk,
+        the analyzer bisects each one into dozens of doomed requests, and the
+        run ends with a success dialog over an empty CSV.
+        """
+        host = self.host_var.get().strip().rstrip("/")
+        model = self.model_var.get().strip()
+        try:
+            with urllib.request.urlopen(f"{host}/api/tags", timeout=5) as response:
+                installed = json.loads(response.read().decode("utf-8")).get("models", [])
+        except Exception as exc:  # noqa: BLE001 - any failure means "not usable"
+            messagebox.showerror(
+                "🦭🔌 連不上 Ollama",
+                f"無法連線 {host}\n\n{exc}\n\n請先啟動 Ollama（命令列輸入 ollama serve），再按一次開始。",
+            )
+            return False
+        names = [str(item.get("name", "")) for item in installed if item.get("name")]
+        if not names:
+            messagebox.showerror(
+                "🦭📦 Ollama 沒有任何模型",
+                f"{host} 連得上，但一個模型都沒有。\n\n請先執行：ollama pull {model or 'qwen3:4b'}",
+            )
+            return False
+        if model not in names and f"{model}:latest" not in names:
+            messagebox.showerror(
+                "🦭📦 找不到這個模型",
+                f"「{model}」沒有安裝在 {host}。\n\n已安裝的是：\n"
+                + "\n".join(f"　• {name}" for name in names[:12])
+                + f"\n\n請改填上面其中一個，或先執行：ollama pull {model}",
+            )
+            return False
+        return True
+
     def _start(self) -> None:
         validated = self._validate()
         if validated is None:
+            return
+        if not self._preflight():
             return
         sources, chunk_chars, chunk_segments, min_codes, context_radius, min_context_segments = validated
         command = [
@@ -858,6 +968,16 @@ class OpenCodingGUI(tk.Tk):
         self.progress.start(12)
         self.status_var.set("分析中…")
         threading.Thread(target=self._run_process, args=(command,), daemon=True).start()
+
+    def _open_output_folder(self) -> None:
+        folder = self.output_var.get().strip()
+        try:
+            if hasattr(os, "startfile"):
+                os.startfile(folder)  # noqa: S606 - the user's own output folder
+            else:
+                subprocess.Popen(["xdg-open", folder])
+        except OSError as exc:
+            messagebox.showerror("無法開啟資料夾", f"{folder}\n\n{exc}")
 
     def _snapshot_csvs(self) -> dict[Path, int]:
         folder = Path(self.output_var.get().strip())
@@ -979,7 +1099,12 @@ class OpenCodingGUI(tk.Tk):
                     self._finish(1)
         except queue.Empty:
             pass
-        self.after(100, self._drain_events)
+        except Exception as exc:  # noqa: BLE001 - the pump must outlive any handler
+            # Anything escaping here used to stop the re-arm below, freezing the
+            # log and leaving the start button disabled with no error on screen.
+            self._append_log(f"介面事件處理發生問題（已忽略）：{exc}\n")
+        finally:
+            self.after(100, self._drain_events)
 
     def _finish(self, return_code: int) -> None:
         self.seal_animation_active = False
@@ -999,15 +1124,38 @@ class OpenCodingGUI(tk.Tk):
             f"跳過既有結果：{self.skipped_count} 份\n"
             f"失敗：{self.failed_count} 份"
         )
+        output_folder = self.output_var.get().strip()
+        produced = "\n".join(f"　• {path.name}" for path in self.last_result_files[:6])
+        if len(self.last_result_files) > 6:
+            produced += f"\n　…共 {len(self.last_result_files)} 個檔案"
+        where = f"\n\n結果位置：{output_folder}"
+        if produced:
+            where += f"\n{produced}"
         if return_code == 0:
             self.status_var.set(f"全部完成｜{elapsed}｜完成 {self.completed_count} 份")
-            message = summary + "\n\n按主畫面的「閱讀結果」即可逐頁查看。"
-            messagebox.showinfo("Open Coding 完成", message)
+            messagebox.showinfo(
+                "Open Coding 完成",
+                summary + where + "\n\n按主畫面的「閱讀結果」即可逐頁查看，或按「開啟輸出資料夾」。",
+            )
         elif self.cancel_requested:
             self.status_var.set(f"已停止｜執行 {elapsed}｜完成 {self.completed_count} 份")
+        elif self.completed_count == self.skipped_count == self.failed_count == 0:
+            # Every early exit in open_coding.main() returns 2 without printing a
+            # per-document failure line, so all three counters stay 0 and the old
+            # dialog said "部分文檔失敗" while naming nothing.
+            self.status_var.set(f"沒有開始分析｜{elapsed}")
+            messagebox.showwarning(
+                "Open Coding 沒有開始",
+                "程式在讀取設定的階段就結束了，沒有分析任何逐字稿。\n\n"
+                "常見原因：研究指引讀不到或是空白、資料夾裡沒有 .txt/.md/.docx、"
+                "輸出資料夾無法寫入。\n\n請看下方「處理進度」的最後幾行。",
+            )
         else:
             self.status_var.set(f"批次結束｜{elapsed}｜完成 {self.completed_count} 份、失敗 {self.failed_count} 份")
-            messagebox.showwarning("Open Coding 批次結束", summary + "\n\n部分文檔失敗，請查看處理進度；其他完成結果仍可閱讀。")
+            messagebox.showwarning(
+                "Open Coding 批次結束",
+                summary + where + "\n\n部分文檔失敗，請查看處理進度；其他完成結果仍可閱讀。",
+            )
 
     def _on_close(self) -> None:
         if self.process and self.process.poll() is None:

@@ -11,11 +11,14 @@ import argparse
 import csv
 import hashlib
 import json
+import os
 import re
 import socket
 import sys
 import time
+import unicodedata
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 from dataclasses import dataclass
@@ -25,6 +28,15 @@ from xml.etree import ElementTree
 
 
 SUPPORTED = {".txt", ".md", ".docx"}
+# A transcript with no sentence-ending punctuation (raw ASR output, for
+# instance) would otherwise become one unbounded segment that no chunk limit
+# can split and no model can read.
+MAX_SEGMENT_CHARS = 400
+SOFT_BREAK = re.compile(r"(?<=[，,、])\s*")
+# Locality is a product promise, not a default. main() may relax this for a
+# deliberate --allow-remote-host run; the GUI never does.
+ALLOW_REMOTE_HOST = False
+LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost", "0.0.0.0"}
 SENTENCE_END = re.compile(r"(?<=[。！？!?；;])\s*|(?<=[.])\s+(?=[A-Z0-9\[（(])")
 SPEAKER = re.compile(r"^\s*([^：:\n]{1,30})[：:]\s*(.*)$")
 RESPONDENT_DASH = re.compile(r"^\s*[-–—]\s*(.+)$")
@@ -68,16 +80,27 @@ class Segment:
 def read_document(path: Path) -> str:
     suffix = path.suffix.lower()
     if suffix in {".txt", ".md"}:
-        for encoding in ("utf-8-sig", "utf-8", "cp950"):
+        # gb18030 precedes cp950: a Simplified-Chinese file decodes through
+        # cp950 without error, into mojibake the tool would then analyse for
+        # an hour. gb18030 covers Simplified properly and fails loudly on
+        # genuine Big5, so the ladder still ends where it used to.
+        for encoding in ("utf-8-sig", "utf-8", "gb18030", "cp950"):
             try:
                 return path.read_text(encoding=encoding)
             except UnicodeDecodeError:
                 continue
         raise ValueError(f"無法判斷文字編碼：{path}")
     if suffix == ".docx":
-        with zipfile.ZipFile(path) as archive:
-            xml = archive.read("word/document.xml")
-        root = ElementTree.fromstring(xml)
+        try:
+            with zipfile.ZipFile(path) as archive:
+                xml = archive.read("word/document.xml")
+            root = ElementTree.fromstring(xml)
+        except KeyError as exc:
+            raise ValueError(
+                f"這個 .docx 裡沒有 Word 內容（可能是 Pages/ODT 改的副檔名）：{path}"
+            ) from exc
+        except ElementTree.ParseError as exc:
+            raise ValueError(f"這個 .docx 的內容無法解析：{path}") from exc
         ns = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
         paragraphs = []
         for paragraph in root.iter(ns + "p"):
@@ -88,6 +111,34 @@ def read_document(path: Path) -> str:
     raise ValueError(f"不支援的格式：{path.suffix}")
 
 
+def _split_oversized(sentences: list[str]) -> list[str]:
+    """Break any sentence too long to survive a chunk limit or a context window.
+
+    Unpunctuated ASR output arrives as one enormous "sentence"; chunk_segments
+    cannot split a single item, so the model would be handed the whole
+    transcript and time out repeatedly. Prefer commas, then a hard slice.
+    """
+    result: list[str] = []
+    for sentence in sentences:
+        if len(sentence) <= MAX_SEGMENT_CHARS:
+            result.append(sentence)
+            continue
+        pieces = [part.strip() for part in SOFT_BREAK.split(sentence) if part.strip()]
+        buffer = ""
+        for piece in pieces:
+            while len(piece) > MAX_SEGMENT_CHARS:
+                result.append(piece[:MAX_SEGMENT_CHARS])
+                piece = piece[MAX_SEGMENT_CHARS:]
+            if buffer and len(buffer) + len(piece) > MAX_SEGMENT_CHARS:
+                result.append(buffer)
+                buffer = piece
+            else:
+                buffer = f"{buffer}{piece}" if buffer else piece
+        if buffer:
+            result.append(buffer)
+    return result
+
+
 def segment_transcript(text: str, context_radius: int = 6) -> list[Segment]:
     """Split a transcript and attach a broad reading window to each segment.
 
@@ -96,6 +147,10 @@ def segment_transcript(text: str, context_radius: int = 6) -> list[Segment]:
     """
     segments: list[Segment] = []
     counter = 1
+    # "受訪者：" on its own line, with the turn wrapped underneath, is a common
+    # export format. Without this the label became an empty segment and every
+    # real utterance below it lost its speaker.
+    pending_speaker = ""
     for line_number, raw_line in enumerate(text.splitlines(), 1):
         line = raw_line.strip()
         if not line:
@@ -114,13 +169,18 @@ def segment_transcript(text: str, context_radius: int = 6) -> list[Segment]:
             speaker, content = "講者（-標記）", dash_match.group(1).strip()
         elif match and _is_speaker_label(match.group(1)):
             speaker, content = match.group(1).strip(), match.group(2).strip()
+            if not content:
+                # A bare label owns the lines that follow it, until the next.
+                pending_speaker = speaker
+                continue
+            pending_speaker = ""
         else:
-            speaker, content = "", line
+            speaker, content = pending_speaker, line
         # Preserve each meaningful sentence while retaining its source line.
         sentences = [part.strip() for part in SENTENCE_END.split(content) if part.strip()]
         if not sentences:
             sentences = [content]
-        for sentence in sentences:
+        for sentence in _split_oversized(sentences):
             segments.append(Segment(f"S{counter:06d}", line_number, speaker, sentence))
             counter += 1
     def context_line(segment: Segment) -> str:
@@ -156,13 +216,50 @@ def chunk_segments(segments: list[Segment], max_chars: int, max_segments: int = 
         yield chunk
 
 
-def ollama_chat(host: str, model: str, system: str, prompt: str, timeout: int) -> dict:
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A 307/308 preserves the POST body, so a redirect would carry the
+    transcript off-machine even when the configured host is loopback."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(
+            req.full_url, code, f"不接受轉址（{newurl}）", headers, fp
+        )
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
+def assert_local_host(host: str) -> None:
+    """Refuse any endpoint that would send transcript text off this machine."""
+    if ALLOW_REMOTE_HOST:
+        return
+    parts = urllib.parse.urlsplit(host if "//" in host else f"http://{host}")
+    if parts.scheme not in ("http", "https") or (parts.hostname or "") not in LOOPBACK_HOSTS:
+        raise RuntimeError(
+            f"僅允許本機 Ollama（127.0.0.1 或 localhost），收到：{host}。"
+            "逐字稿不會送往其他主機；若確實需要，請用 --allow-remote-host。"
+        )
+
+
+def ollama_chat(
+    host: str,
+    model: str,
+    system: str,
+    prompt: str,
+    timeout: int,
+    num_ctx: int = 8192,
+) -> dict:
+    assert_local_host(host)
     url = host.rstrip("/") + "/api/chat"
     payload = {
         "model": model,
         "stream": False,
         "format": "json",
-        "options": {"temperature": 0.1},
+        # Without num_ctx Ollama silently discards everything past its 4096
+        # default -- including the segment list -- and the model then invents
+        # quotes it never saw. Every "cannot be located" retry downstream
+        # assumes the model read the input, so this has to be set here.
+        "options": {"temperature": 0.1, "num_ctx": num_ctx},
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": prompt},
@@ -175,23 +272,41 @@ def ollama_chat(host: str, model: str, system: str, prompt: str, timeout: int) -
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with _OPENER.open(request, timeout=timeout) as response:
             body = json.loads(response.read().decode("utf-8"))
     except (TimeoutError, socket.timeout) as exc:
         raise RuntimeError(f"模型請求逾時（{timeout} 秒）") from exc
     except urllib.error.HTTPError as exc:
         if exc.code in {408, 504}:
             raise RuntimeError(f"模型請求逾時（HTTP {exc.code}，上限 {timeout} 秒）") from exc
-        raise RuntimeError(f"Ollama HTTP 錯誤（{exc.code}）：{exc.reason}") from exc
+        # Ollama puts the actionable text in the body, not the reason phrase:
+        # a 404 says model "x" not found, try pulling it first.
+        try:
+            detail = exc.read().decode("utf-8", "replace")[:300].strip()
+        except Exception:  # noqa: BLE001 - the body is best-effort context
+            detail = ""
+        message = f"Ollama HTTP 錯誤（{exc.code}）：{detail or exc.reason}"
+        if 400 <= exc.code < 500:
+            # A bad model name or malformed request fails identically for every
+            # sub-chunk. Marking it lets analyze_chunk stop instead of bisecting
+            # into ~87 doomed requests per chunk.
+            message = f"設定錯誤｜{message}"
+        raise RuntimeError(message) from exc
     except urllib.error.URLError as exc:
         if isinstance(exc.reason, (TimeoutError, socket.timeout)):
             raise RuntimeError(f"模型請求逾時（{timeout} 秒）") from exc
         raise RuntimeError(f"無法連線 Ollama（{url}）：{exc}") from exc
     content = body.get("message", {}).get("content", "")
     try:
-        return json.loads(content)
+        parsed = json.loads(content)
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"模型沒有回傳有效 JSON：{content[:500]}") from exc
+    if not isinstance(parsed, dict):
+        # Ollama's JSON mode also permits a top-level array, which small models
+        # emit routinely. Every caller handles RuntimeError; none survives an
+        # AttributeError from .get on a list.
+        raise RuntimeError(f"模型回傳的 JSON 不是物件：{content[:200]}")
+    return parsed
 
 
 def build_prompt(
@@ -280,12 +395,12 @@ def _rubric_value(row: dict, name: str, default: int) -> int:
 
 def quality_dimensions(row: dict, segment: Segment) -> dict[str, int | str]:
     """Normalize model rubric fields; legacy results receive neutral defaults."""
-    text_length = len(re.sub(r"[^\w\u3400-\u9fff]", "", segment.text))
-    evidence_default = 3 if text_length >= 20 else 2
+    # A longer sentence is not stronger evidence -- README and the prompt both
+    # forbid scoring by length, so the default no longer varies with it.
     values = {
         "research_relevance": _rubric_value(row, "research_relevance", 2),
         "behavior_pattern": _rubric_value(row, "behavior_pattern", 2),
-        "evidence_strength": _rubric_value(row, "evidence_strength", evidence_default),
+        "evidence_strength": _rubric_value(row, "evidence_strength", 2),
         "opportunity_potential": _rubric_value(row, "opportunity_potential", 1),
         "inference_risk": _rubric_value(row, "inference_risk", 1),
     }
@@ -374,11 +489,24 @@ def looks_like_interviewer_turn(segment: Segment) -> bool:
         return False
     if re.match(r"^(?:那|所以|還是)?\s*(?:你|您)(?:覺得|認為|會|想|願意|有沒有|知不知道|是否)", text):
         return True
-    if not segment.speaker and text.endswith(("?", "？")):
+    # A first-person account is the most valuable utterance in the corpus, and
+    # the heuristics below are shape-based enough to swallow one whole:
+    # "他們說這個系統會提供提醒，可是我沒收到。" matched the pitch pattern.
+    first_person = re.search(
+        r"(?:我|我們)(?:.{0,8})?(?:覺得|認為|想|會|沒|不|有|用|收到|遇到|發現|喜歡|討厭|習慣|試)",
+        text,
+    )
+    if not segment.speaker and text.endswith(("?", "？")) and not first_person:
         return True
-    if re.search(r"(?:我們|本研究|這個).{0,16}(?:系統|工具|功能|產品).{0,12}(?:會|可以|提供)", text):
+    if not first_person and re.search(
+        r"(?:我們|本研究|這個).{0,16}(?:系統|工具|功能|產品).{0,12}(?:會|可以|提供)", text
+    ):
         return True
-    if ("?" in text or "？" in text) and re.search(r"(?:你|您|會不會|有沒有|覺得|願意|想不想)", text):
+    if (
+        ("?" in text or "？" in text)
+        and not first_person
+        and re.search(r"(?:你|您|會不會|有沒有|覺得|願意|想不想)", text)
+    ):
         return True
     return False
 
@@ -631,7 +759,7 @@ def refine_evidence_ranges(
             + json.dumps(candidates, ensure_ascii=False)
         )
         try:
-            result = ollama_chat(args.host, args.model, system, prompt, args.timeout)
+            result = ollama_chat(args.host, args.model, system, prompt, args.timeout, num_ctx=getattr(args, "num_ctx", 8192))
             contexts = result.get("contexts", [])
             if not isinstance(contexts, list):
                 raise RuntimeError("語證校正結果的 contexts 必須是陣列")
@@ -722,6 +850,17 @@ def refine_evidence_ranges(
     return corrected
 
 
+def match_key(text: str) -> str:
+    """Fold the differences that make a genuine verbatim quote fail to match.
+
+    Full-width and half-width punctuation are interchangeable in Chinese
+    transcripts, and Word exports and ASR both scatter spaces inside CJK runs.
+    Comparing on the folded form keeps grounding strict about *content* while
+    tolerating typography; the text written to the CSV is always the original.
+    """
+    return re.sub(r"\s+", "", unicodedata.normalize("NFKC", text))
+
+
 def validate_codings(
     result: dict,
     segments: list[Segment],
@@ -741,24 +880,35 @@ def validate_codings(
             continue
         requested_id = str(row.get("segment_id", ""))
         requested = by_id.get(requested_id)
-        if requested is not None and evidence in requested.text:
+        evidence_key = match_key(evidence)
+        if not evidence_key:
+            continue
+        if requested is not None and evidence_key in match_key(requested.text):
             grounded = requested
         else:
             # Repair a wrong model-supplied ID only when its verbatim evidence
             # unambiguously identifies another source segment in this chunk.
-            matches = [segment for segment in segments if evidence in segment.text]
+            matches = [
+                segment for segment in segments
+                if evidence_key in match_key(segment.text)
+            ]
             if len(matches) != 1:
                 continue
             grounded = matches[0]
         if allowed_ids is not None and grounded.id not in allowed_ids:
             continue
+        if evidence not in grounded.text:
+            # Matched on the folded form, so the model's copy differs from the
+            # source in punctuation width or spacing. The row must carry the
+            # source's characters, never the model's rendering of them.
+            evidence = grounded.text
         normalized_text = re.sub(r"^[+\-–—\s]+", "", grounded.text.strip())
         if MINIMAL_RESPONSE.fullmatch(normalized_text):
             continue
         meaningful_chars = re.sub(r"[^\w\u3400-\u9fff]", "", grounded.text)
         if len(meaningful_chars) < 6 or looks_like_interviewer_turn(grounded):
             continue
-        if len(re.sub(r"[^\w\u3400-\u9fff]", "", evidence)) <= 12 and len(meaningful_chars) >= 20:
+        if len(re.sub(r"[^\w\u3400-\u9fff]", "", evidence)) <= 12 and len(meaningful_chars) >= 20:  # noqa: E501
             evidence = grounded.text
         try:
             confidence = min(1.0, max(0.0, float(row.get("confidence", 0))))
@@ -913,7 +1063,7 @@ def _focused_select(
     # is enough; evidence-scored fallback handles malformed output instantly.
     for attempt in range(1):
         try:
-            result = ollama_chat(args.host, args.model, system, prompt, args.timeout)
+            result = ollama_chat(args.host, args.model, system, prompt, args.timeout, num_ctx=getattr(args, "num_ctx", 8192))
             selections = result.get("selections", [])
             if not isinstance(selections, list):
                 raise RuntimeError("聚焦精選結果的 selections 必須是陣列")
@@ -961,7 +1111,10 @@ def _focused_select(
             return refined
         except RuntimeError as exc:
             last_error = exc
-            if "無法連線 Ollama" in str(exc):
+            if any(mark in str(exc) for mark in ("無法連線 Ollama", "設定錯誤", "僅允許本機")):
+                # A missing model or a rejected host fails identically for every
+                # sub-chunk; bisecting would cost ~87 requests and 90s of sleep
+                # per chunk and still end in an empty CSV reported as success.
                 raise
     print(f"    警告：{stage}失敗：{last_error}", flush=True)
     return None
@@ -1194,7 +1347,7 @@ def _recover_research_directions(
         + json.dumps(compact_items, ensure_ascii=False)
     )
     try:
-        result = ollama_chat(args.host, args.model, system, prompt, args.timeout)
+        result = ollama_chat(args.host, args.model, system, prompt, args.timeout, num_ctx=getattr(args, "num_ctx", 8192))
         return _validate_research_directions(result.get("research_directions", []), coding_by_id)
     except (RuntimeError, AttributeError, TypeError, ValueError) as exc:
         return [], [f"專用恢復整理失敗：{exc}"]
@@ -1265,7 +1418,7 @@ def generate_document_profile(
         return value
 
     try:
-        result = ollama_chat(args.host, args.model, system, prompt, args.timeout)
+        result = ollama_chat(args.host, args.model, system, prompt, args.timeout, num_ctx=getattr(args, "num_ctx", 8192))
     except (RuntimeError, AttributeError, TypeError, ValueError) as exc:
         print(f"    警告：文本基本資訊整理失敗：{exc}", flush=True)
         return fallback
@@ -1305,10 +1458,13 @@ def generate_document_synthesis(
         coding_items.append({
             "candidate_id": candidate_id,
             "segment_id": coding.get("segment_id", ""),
-            "evidence_quote": coding.get("evidence_quote", ""),
-            "evidence_context": coding.get("evidence_context", ""),
+            "evidence_quote": _shorten(str(coding.get("evidence_quote", ""))),
+            # Untruncated, 50 codings sent ~20k characters -- more than the
+            # context window, so the tail was silently dropped and the model
+            # synthesized directions from codes it had never seen.
+            "evidence_context": _shorten(str(coding.get("evidence_context", "")), 320),
             "code": coding.get("code", ""),
-            "why_this_code": coding.get("rationale", ""),
+            "why_this_code": _shorten(str(coding.get("rationale", ""))),
         })
 
     profile = generate_document_profile(guide, source, segments, codings, args)
@@ -1326,7 +1482,7 @@ def generate_document_synthesis(
     directions: list[dict] = []
     direction_failures: list[str] = []
     try:
-        result = ollama_chat(args.host, args.model, system, prompt, args.timeout)
+        result = ollama_chat(args.host, args.model, system, prompt, args.timeout, num_ctx=getattr(args, "num_ctx", 8192))
         directions, direction_failures = _validate_research_directions(
             result.get("research_directions", []), coding_by_id,
         )
@@ -1540,7 +1696,7 @@ def _consolidate_context_group(
         "待檢查的同脈絡 codes：\n" + json.dumps(candidates, ensure_ascii=False)
     )
     try:
-        response = ollama_chat(args.host, args.model, system, prompt, args.timeout)
+        response = ollama_chat(args.host, args.model, system, prompt, args.timeout, num_ctx=getattr(args, "num_ctx", 8192))
     except (RuntimeError, AttributeError, TypeError, ValueError) as exc:
         print(f"    警告：同脈絡 code 一致性檢查失敗，保留原 codes：{exc}", flush=True)
         return None
@@ -1661,15 +1817,15 @@ def analyze_chunk(
                 "且 segment_id 必須是該證據所在段落；不要改字、摘要或跨段拼接。"
             )
         try:
-            result = ollama_chat(args.host, args.model, system, retry_prompt, args.timeout)
+            result = ollama_chat(args.host, args.model, system, retry_prompt, args.timeout, num_ctx=getattr(args, "num_ctx", 8192))
             validated = validate_codings(result, chunk, allowed_ids=allowed_ids)
             chunk_by_id = {segment.id: segment for segment in chunk}
             attempted_substantive = any(
                 isinstance(row, dict)
-                and row.get("segment_id") in allowed_ids
-                and row.get("segment_id") in chunk_by_id
-                and not MINIMAL_RESPONSE.fullmatch(re.sub(r"^[+\-–—\s]+", "", chunk_by_id[row["segment_id"]].text.strip()))
-                and not looks_like_interviewer_turn(chunk_by_id[row["segment_id"]])
+                and str(row.get("segment_id", "")) in allowed_ids
+                and str(row.get("segment_id", "")) in chunk_by_id
+                and not MINIMAL_RESPONSE.fullmatch(re.sub(r"^[+\-–—\s]+", "", chunk_by_id[str(row.get("segment_id", ""))].text.strip()))
+                and not looks_like_interviewer_turn(chunk_by_id[str(row.get("segment_id", ""))])
                 for row in result.get("codings", [])
             )
             if attempted_substantive and not validated:
@@ -1705,7 +1861,10 @@ def analyze_chunk(
             last_error = exc
             # Connection failures affect every possible subchunk; fail fast so
             # the user gets the real infrastructure error.
-            if "無法連線 Ollama" in str(exc):
+            if any(mark in str(exc) for mark in ("無法連線 Ollama", "設定錯誤", "僅允許本機")):
+                # A missing model or a rejected host fails identically for every
+                # sub-chunk; bisecting would cost ~87 requests and 90s of sleep
+                # per chunk and still end in an empty CSV reported as success.
                 raise
             # Retrying the same oversized prompt wastes another full timeout.
             # Split it immediately; only a single-segment timeout is skipped.
@@ -1793,7 +1952,11 @@ def code_file(
 
     destination = destination or output_path(source, args.output_dir)
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    with destination.open("w", encoding="utf-8-sig", newline="") as handle:
+    # Written to a sibling and renamed: a crash or Ctrl-C mid-write used to
+    # leave a truncated CSV that the next run's skip-if-exists treated as a
+    # finished document, forever.
+    staging = destination.with_name(destination.name + ".partial")
+    with staging.open("w", encoding="utf-8-sig", newline="") as handle:
         fieldnames = [
             "row_type", "source_file", "segment_id", "line_number", "speaker",
             "context_before", "quote_verbatim", "context_after", "full_context",
@@ -1845,8 +2008,17 @@ def code_file(
             "row_type": "research_directions", "source_file": source.name,
             "research_directions": directions_text,
         })
+    os.replace(staging, destination)
     if skipped_segments:
         print(f"  注意：共有 {skipped_segments} 個片段因無法可靠定位而略過，其餘結果已保留。", flush=True)
+    if not all_codings:
+        # An empty CSV reported as success is the worst outcome this tool can
+        # produce, so it says so in the one place the GUI surfaces.
+        print(
+            "  警告：這份逐字稿沒有產生任何 code。常見原因：模型名稱打錯、"
+            "Ollama 未啟動、逐字稿沒有可分析的實質內容，或研究指引與內容無關。",
+            flush=True,
+        )
     return destination, len(all_codings)
 
 
@@ -1854,7 +2026,10 @@ def collect_sources(inputs: list[Path], guide_path: Path, output_dir: Path) -> l
     found: list[Path] = []
     for item in inputs:
         if item.is_dir():
-            found.extend(p for p in item.rglob("*") if p.suffix.lower() in SUPPORTED)
+            found.extend(
+                p for p in item.rglob("*")
+                if p.is_file() and p.suffix.lower() in SUPPORTED
+            )
         elif item.suffix.lower() in SUPPORTED:
             found.append(item)
         else:
@@ -1884,6 +2059,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--context-radius", type=int, default=12, help="每句前後可供模型判斷的上下文句數")
     parser.add_argument("--min-context-segments", type=int, default=5, help="每筆 code 至少顯示的上下文句數")
     parser.add_argument("--timeout", type=int, default=600, help="每區塊逾時秒數")
+    parser.add_argument(
+        "--num-ctx", type=int, default=8192,
+        help="送給 Ollama 的 context 長度；太小模型會看不到片段清單（預設 8192）",
+    )
+    parser.add_argument(
+        "--allow-remote-host", action="store_true",
+        help="允許非本機的 Ollama 位址。預設拒絕，逐字稿不會離開這台電腦。",
+    )
     parser.add_argument("--retries", type=int, default=2, help="模型格式錯誤或連線失敗重試次數")
     parser.add_argument("--overwrite", action="store_true", help="覆寫已存在的 CSV；預設跳過")
     parser.add_argument(
@@ -1898,7 +2081,17 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    global ALLOW_REMOTE_HOST
     args = parse_args()
+    ALLOW_REMOTE_HOST = bool(getattr(args, "allow_remote_host", False))
+    try:
+        assert_local_host(args.host)
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    if not 1024 <= args.num_ctx <= 131072:
+        print("--num-ctx 必須介於 1024 到 131072", file=sys.stderr)
+        return 2
     if args.chunk_chars < 500:
         print("--chunk-chars 不可小於 500", file=sys.stderr)
         return 2
@@ -1925,6 +2118,16 @@ def main() -> int:
     sources = collect_sources(args.inputs, args.guide, args.output_dir)
     if not sources:
         print("找不到支援的逐字稿檔案", file=sys.stderr)
+        return 2
+    # The output folder used to be created only after every model call had
+    # finished, so an unwritable path threw away a whole overnight batch.
+    try:
+        args.output_dir.mkdir(parents=True, exist_ok=True)
+        probe = args.output_dir / ".seal_write_test"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+    except OSError as exc:
+        print(f"輸出資料夾無法寫入：{args.output_dir}（{exc}）", file=sys.stderr)
         return 2
 
     failures = 0

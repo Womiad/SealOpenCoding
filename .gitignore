@@ -80,3 +80,8 @@ research_guide*.docx
 *.key
 credentials.*
 secrets.*
+
+# Evaluation kit: synthetic data, templates and scripts only (no participant data)
+!/evaluation_kit/*.docx
+!/evaluation_kit/*.xlsx
+/evaluation_kit/paper/
