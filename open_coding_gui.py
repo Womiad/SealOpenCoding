@@ -1002,6 +1002,15 @@ class OpenCodingGUI(tk.Tk):
 
     def _run_process(self, command: list[str]) -> None:
         try:
+            # A Windows process whose stdout is redirected to a pipe commonly
+            # falls back to the active ANSI code page (for example CP950).
+            # The GUI reads the pipe as UTF-8, so Chinese progress messages
+            # used to turn into mojibake even though files were UTF-8.  Force
+            # Python's stdio encoding for the child instead of relying on the
+            # machine-wide console/code-page setting.
+            child_env = os.environ.copy()
+            child_env["PYTHONIOENCODING"] = "utf-8"
+            child_env["PYTHONUTF8"] = "1"
             self.process = subprocess.Popen(
                 command,
                 cwd=str(APP_DIR),
@@ -1010,6 +1019,7 @@ class OpenCodingGUI(tk.Tk):
                 text=True,
                 encoding="utf-8",
                 errors="replace",
+                env=child_env,
                 creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
             )
             assert self.process.stdout is not None

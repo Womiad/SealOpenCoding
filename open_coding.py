@@ -1926,6 +1926,12 @@ def code_file(
         print(f"  聚焦精選完成：保留 {len(all_codings)} 個具分析價值的 code。", flush=True)
 
     if all_codings:
+        evidence_batches = (len(all_codings) + 4) // 5
+        print(
+            f"  接下來會完成 {evidence_batches} 批語證校正與最後整理；"
+            "為避免留下損壞檔案，CSV 會在全部完成後一次寫入。",
+            flush=True,
+        )
         all_codings = refine_evidence_ranges(guide, all_codings, segments, args)
         all_codings = consolidate_context_codings(guide, all_codings, segments, args)
         all_codings = sort_codings_in_transcript_order(all_codings, segments)
@@ -1956,6 +1962,7 @@ def code_file(
     # leave a truncated CSV that the next run's skip-if-exists treated as a
     # finished document, forever.
     staging = destination.with_name(destination.name + ".partial")
+    print(f"  正在寫入 CSV：{destination}", flush=True)
     with staging.open("w", encoding="utf-8-sig", newline="") as handle:
         fieldnames = [
             "row_type", "source_file", "segment_id", "line_number", "speaker",
