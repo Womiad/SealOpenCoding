@@ -17,6 +17,8 @@ import time
 import urllib.request
 from pathlib import Path
 import tkinter as tk
+
+from win_icon import install_window_icon, set_app_identity
 from tkinter import filedialog, messagebox, ttk
 
 EXAMPLE_GUIDE = """# 研究目的
@@ -54,6 +56,8 @@ EXAMPLE_GUIDE = """# 研究目的
 APP_DIR = Path(__file__).resolve().parent
 SCRIPT = APP_DIR / "open_coding.py"
 ICON = APP_DIR / "seal_open_coding_icon.png"
+ICON_ICO = APP_DIR / "seal_open_coding_icon.ico"
+READER_ICON_ICO = APP_DIR / "seal_code_reader_icon.ico"
 READER_ICON = APP_DIR / "seal_code_reader_icon.png"
 APP_NAME = "海豹牌 Open Coding 工具"
 APP_VERSION = "V1.7.1"
@@ -285,6 +289,7 @@ class CodingResultReader(tk.Toplevel):
         super().__init__(parent)
         self.parent = parent
         self.title(f"Seal Code Reader {APP_VERSION}（內建）")
+        install_window_icon(self, READER_ICON_ICO)
         self.geometry(READER_DEFAULT_GEOMETRY)
         self.minsize(*READER_MINIMUM_SIZE)
         self.reader_icon: tk.PhotoImage | None = None
@@ -623,6 +628,11 @@ class OpenCodingGUI(tk.Tk):
         self.overwrite_var = tk.BooleanVar(value=False)
         self.focused_var = tk.BooleanVar(value=True)
         self.status_var = tk.StringVar(value="請選擇研究指引與訪談文本")
+        # The animated dots and the progress context live in their own labels
+        # (dots fixed-width) so each frame stops re-flowing the status line —
+        # the same fix Seal STT applied to its listening animation.
+        self.status_dots_var = tk.StringVar(value="")
+        self.status_context_var = tk.StringVar(value="")
         self.system_usage_var = tk.StringVar(value="CPU 讀取中｜GPU 讀取中")
         self.elapsed_var = tk.StringVar(value="已執行 00:00:00")
 
@@ -768,7 +778,11 @@ class OpenCodingGUI(tk.Tk):
         log_scroll = ttk.Scrollbar(log_box, orient="vertical", command=self.log.yview)
         log_scroll.grid(row=1, column=1, sticky="ns")
         self.log.configure(yscrollcommand=log_scroll.set)
-        ttk.Label(outer, textvariable=self.status_var).grid(row=8, column=0, sticky="w", pady=(6, 0))
+        status_row = ttk.Frame(outer)
+        status_row.grid(row=8, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(status_row, textvariable=self.status_var).pack(side="left")
+        ttk.Label(status_row, textvariable=self.status_dots_var, width=3).pack(side="left")
+        ttk.Label(status_row, textvariable=self.status_context_var).pack(side="left")
 
     def _existing_sources(self) -> set[str]:
         return set(self.sources.get(0, "end"))
@@ -966,7 +980,7 @@ class OpenCodingGUI(tk.Tk):
         self.start_button.configure(state="disabled")
         self.cancel_button.configure(state="normal")
         self.progress.start(12)
-        self.status_var.set("分析中…")
+        self._set_plain_status("分析中…")
         threading.Thread(target=self._run_process, args=(command,), daemon=True).start()
 
     def _open_output_folder(self) -> None:
@@ -1002,15 +1016,11 @@ class OpenCodingGUI(tk.Tk):
 
     def _run_process(self, command: list[str]) -> None:
         try:
-            # A Windows process whose stdout is redirected to a pipe commonly
-            # falls back to the active ANSI code page (for example CP950).
-            # The GUI reads the pipe as UTF-8, so Chinese progress messages
-            # used to turn into mojibake even though files were UTF-8.  Force
-            # Python's stdio encoding for the child instead of relying on the
-            # machine-wide console/code-page setting.
-            child_env = os.environ.copy()
-            child_env["PYTHONIOENCODING"] = "utf-8"
-            child_env["PYTHONUTF8"] = "1"
+            # The pipe is decoded as UTF-8 below, but on Windows a child
+            # Python defaults its stdout to the ANSI code page (cp950), so the
+            # structured log lines arrived as mojibake. PYTHONUTF8 makes the
+            # child emit UTF-8 so both ends of the pipe finally agree.
+            child_env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
             self.process = subprocess.Popen(
                 command,
                 cwd=str(APP_DIR),
@@ -1038,7 +1048,7 @@ class OpenCodingGUI(tk.Tk):
             self.process.terminate()
             self.seal_animation_active = False
             self._append_log("已要求停止；正在處理的該份文檔不會產生半成品 CSV。\n")
-            self.status_var.set("正在停止…")
+            self._set_plain_status("正在停止…")
 
     def _append_log(self, text: str, seal: bool = False) -> None:
         self.log.configure(state="normal")
@@ -1061,12 +1071,19 @@ class OpenCodingGUI(tk.Tk):
             self._append_log(self._next_seal_thinking_line() + "\n", seal=True)
         self.after(9000, self._rotate_seal_log)
 
+    def _set_plain_status(self, text: str) -> None:
+        """Static status: clear the animation-only labels so no dots linger."""
+        self.status_var.set(text)
+        self.status_dots_var.set("")
+        self.status_context_var.set("")
+
     def _animate_analysis_status(self) -> None:
         if self.seal_animation_active:
             dots = SEAL_DOT_FRAMES[self.seal_animation_frame % len(SEAL_DOT_FRAMES)]
             self.seal_animation_frame += 1
-            context = f"｜{self.seal_status_context}" if self.seal_status_context else ""
-            self.status_var.set(f"🦭 海豹正在分析{dots}{context}")
+            self.status_var.set("🦭 海豹正在分析")
+            self.status_dots_var.set(dots)
+            self.status_context_var.set(f"｜{self.seal_status_context}" if self.seal_status_context else "")
         self.after(420, self._animate_analysis_status)
 
     def _update_elapsed(self) -> None:
@@ -1142,18 +1159,18 @@ class OpenCodingGUI(tk.Tk):
         if produced:
             where += f"\n{produced}"
         if return_code == 0:
-            self.status_var.set(f"全部完成｜{elapsed}｜完成 {self.completed_count} 份")
+            self._set_plain_status(f"全部完成｜{elapsed}｜完成 {self.completed_count} 份")
             messagebox.showinfo(
                 "Open Coding 完成",
                 summary + where + "\n\n按主畫面的「閱讀結果」即可逐頁查看，或按「開啟輸出資料夾」。",
             )
         elif self.cancel_requested:
-            self.status_var.set(f"已停止｜執行 {elapsed}｜完成 {self.completed_count} 份")
+            self._set_plain_status(f"已停止｜執行 {elapsed}｜完成 {self.completed_count} 份")
         elif self.completed_count == self.skipped_count == self.failed_count == 0:
             # Every early exit in open_coding.main() returns 2 without printing a
             # per-document failure line, so all three counters stay 0 and the old
             # dialog said "部分文檔失敗" while naming nothing.
-            self.status_var.set(f"沒有開始分析｜{elapsed}")
+            self._set_plain_status(f"沒有開始分析｜{elapsed}")
             messagebox.showwarning(
                 "Open Coding 沒有開始",
                 "程式在讀取設定的階段就結束了，沒有分析任何逐字稿。\n\n"
@@ -1161,7 +1178,7 @@ class OpenCodingGUI(tk.Tk):
                 "輸出資料夾無法寫入。\n\n請看下方「處理進度」的最後幾行。",
             )
         else:
-            self.status_var.set(f"批次結束｜{elapsed}｜完成 {self.completed_count} 份、失敗 {self.failed_count} 份")
+            self._set_plain_status(f"批次結束｜{elapsed}｜完成 {self.completed_count} 份、失敗 {self.failed_count} 份")
             messagebox.showwarning(
                 "Open Coding 批次結束",
                 summary + where + "\n\n部分文檔失敗，請查看處理進度；其他完成結果仍可閱讀。",
@@ -1179,4 +1196,10 @@ class OpenCodingGUI(tk.Tk):
 
 
 if __name__ == "__main__":
-    OpenCodingGUI().mainloop()
+    # Running under pythonw, the process is otherwise folded into
+    # Python's taskbar group and shows Python's icon regardless of
+    # iconphoto(). Identity must be set before the first window exists.
+    set_app_identity("Womiad.SealOpenCoding")
+    app = OpenCodingGUI()
+    install_window_icon(app, ICON_ICO)
+    app.mainloop()

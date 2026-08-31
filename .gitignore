@@ -85,3 +85,4 @@ secrets.*
 !/evaluation_kit/*.docx
 !/evaluation_kit/*.xlsx
 /evaluation_kit/paper/
+!/evaluation_kit/synthetic_data/埋點對照表.csv

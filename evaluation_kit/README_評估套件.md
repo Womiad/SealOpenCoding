@@ -12,6 +12,8 @@ seal_cloud_proxy.py             Part B：在 127.0.0.1 模仿 Ollama API、轉�
 seal_eval_collect.py            Part B：收集 results/<條件>/run<N>/*.csv → summary / codes_long / planted_autocheck / stability
 seal_make_audit_set.py          Part C：從一份結果 CSV 產生稽核版 A（顯示理由）與 B（隱藏理由）
 seal_dash_to_roles.py           把 Seal STT 的「-」講者格式轉成「訪員：／受訪者：」，再交給 Seal Open Coding
+synthetic_data/                 Part B 合成資料集：11 份新逐字稿（S1D、S2A–D、S3A–D、thin×2）、兩份研究指引、
+                                anchors.json、埋點對照表.csv（14 份共 109 埋點）、SHA256SUMS、檢核腳本；生成器為 Claude（C1/C2 不得用 Anthropic 模型）
 paper/
   mainsinglefile_revised.tex    修訂版論文（可直接編譯；改動處附 %% [Revision note]）
   mainsinglefile_revised.pdf    修訂版編譯結果（4 頁）

@@ -255,6 +255,10 @@ def ollama_chat(
         "model": model,
         "stream": False,
         "format": "json",
+        # qwen3 thinks at length before answering by default; every request was
+        # burning minutes of hidden reasoning tokens before the JSON. Seal STT
+        # already disables it (stt_gui.py) on the same qwen3+Ollama stack.
+        "think": False,
         # Without num_ctx Ollama silently discards everything past its 4096
         # default -- including the segment list -- and the model then invents
         # quotes it never saw. Every "cannot be located" retry downstream
@@ -2088,6 +2092,15 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    # Windows pipes and redirected files default to the ANSI code page; the
+    # GUI (and any log file) expects UTF-8. errors="replace" keeps a bad byte
+    # from ever crashing a long batch over one log line.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except (ValueError, OSError):
+                pass
     global ALLOW_REMOTE_HOST
     args = parse_args()
     ALLOW_REMOTE_HOST = bool(getattr(args, "allow_remote_host", False))
